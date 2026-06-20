@@ -4,6 +4,7 @@ import { analytics, logEvent } from "./firebase";
 
 const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
 const googleBooksApiKey = import.meta.env.GOOGLE_BOOKS_API_KEY;
+const configuredGeminiDailyLimit = Number(import.meta.env.VITE_GEMINI_DAILY_LIMIT);
 let ai = null;
 try {
   if (apiKey) {
@@ -14,6 +15,92 @@ try {
 }
 const MODEL_NAME = "gemini-2.5-flash-lite";
 const GOOGLE_BOOKS_PREVIEW_TIMEOUT_MS = 10000;
+const GOOGLE_BOOKS_PREVIEW_STALE_MS = GOOGLE_BOOKS_PREVIEW_TIMEOUT_MS + 3000;
+const GEMINI_DAILY_LIMIT =
+  Number.isFinite(configuredGeminiDailyLimit) && configuredGeminiDailyLimit > 0
+    ? configuredGeminiDailyLimit
+    : 1000;
+const GEMINI_SCAN_RPM_LIMIT = 15;
+const GEMINI_SCAN_DAILY_TOKEN_LIMIT = 100000;
+const TODAY_SCAN_TOKEN_USAGE_BASELINE = {
+  date: "2026-06-20",
+  count: 50000,
+};
+const TODAY_SCAN_REQUEST_USAGE_BASELINE = {
+  date: "2026-06-20",
+  count: 20,
+};
+const ONE_MINUTE_MS = 60 * 1000;
+
+function getTodayKey() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+function getInitialGeminiUsage() {
+  const todayKey = getTodayKey();
+  const fallback = {
+    date: todayKey,
+    count: 0,
+    promptTokens: 0,
+    requestEvents: [],
+    tokenEvents: [],
+    lastStatus: "Idle",
+    lastType: "",
+    lastUpdatedAt: "",
+  };
+  const storedUsage = readStoredJson("geminiDailyUsage", fallback);
+
+  if (storedUsage?.date !== todayKey) return fallback;
+
+  return {
+    date: todayKey,
+    count: Number(storedUsage?.count || 0),
+    promptTokens: Number(storedUsage?.promptTokens || 0),
+    requestEvents: Array.isArray(storedUsage?.requestEvents)
+      ? storedUsage.requestEvents
+      : [],
+    tokenEvents: Array.isArray(storedUsage?.tokenEvents)
+      ? storedUsage.tokenEvents
+      : [],
+    lastStatus: storedUsage?.lastStatus || "Idle",
+    lastType: storedUsage?.lastType || "",
+    lastUpdatedAt: storedUsage?.lastUpdatedAt || "",
+  };
+}
+
+function getDisplayTime(isoDate) {
+  if (!isoDate) return "";
+
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(isoDate));
+}
+
+function getRecentEvents(events, now = Date.now()) {
+  return (events || []).filter((event) => {
+    const eventTime = new Date(event?.at || event).getTime();
+    return Number.isFinite(eventTime) && now - eventTime < ONE_MINUTE_MS;
+  });
+}
+
+function getPromptTokenCount(result) {
+  return Number(
+    result?.usageMetadata?.promptTokenCount ||
+      result?.usageMetadata?.totalTokenCount ||
+      0
+  );
+}
+
+function getTimestamp() {
+  return new Date().getTime();
+}
 
 const encodeFileToBase64 = (file) =>
   new Promise((resolve, reject) => {
@@ -457,8 +544,12 @@ export default function App() {
   const [compareOpen, setCompareOpen] = useState(false);
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
+  const [geminiUsage, setGeminiUsage] = useState(getInitialGeminiUsage);
+  const [devQuotaOpen, setDevQuotaOpen] = useState(false);
+  const [activeGeminiCalls, setActiveGeminiCalls] = useState(0);
   const [previewCache, setPreviewCache] = useState({});
   const [previewModal, setPreviewModal] = useState(null);
+  const previewCacheRef = useRef({});
   const previewRequestId = useRef(0);
   const [saveStatus, setSaveStatus] = useState(null);
   const [idleBursts, setIdleBursts] = useState([]);
@@ -477,6 +568,71 @@ export default function App() {
     savedFileIdsRef.current = new Set(savedFiles.map((file) => file.id));
   }, [savedFiles]);
 
+  useEffect(() => {
+    localStorage.setItem("geminiDailyUsage", JSON.stringify(geminiUsage));
+  }, [geminiUsage]);
+
+  useEffect(() => {
+    previewCacheRef.current = previewCache;
+  }, [previewCache]);
+
+  function beginGeminiCall(callType) {
+    const todayKey = getTodayKey();
+    const now = new Date().toISOString();
+
+    setGeminiUsage((currentUsage) => {
+      const currentCount =
+        currentUsage?.date === todayKey ? Number(currentUsage.count || 0) : 0;
+
+      return {
+        date: todayKey,
+        count: currentCount + 1,
+        promptTokens: Number(currentUsage?.promptTokens || 0),
+        requestEvents: [
+          ...getRecentEvents(currentUsage?.requestEvents, new Date(now).getTime()),
+          now,
+        ],
+        tokenEvents: getRecentEvents(
+          currentUsage?.tokenEvents,
+          new Date(now).getTime()
+        ),
+        lastStatus: "Running",
+        lastType: callType,
+        lastUpdatedAt: now,
+      };
+    });
+    setActiveGeminiCalls((currentCount) => currentCount + 1);
+  }
+
+  function finishGeminiCall(callType, status, promptTokenCount = 0) {
+    const todayKey = getTodayKey();
+    const now = new Date().toISOString();
+    const nowTime = new Date(now).getTime();
+    const tokens = Number(promptTokenCount || 0);
+
+    setGeminiUsage((currentUsage) => ({
+      date: todayKey,
+      count:
+        currentUsage?.date === todayKey ? Number(currentUsage.count || 0) : 0,
+      promptTokens:
+        (currentUsage?.date === todayKey
+          ? Number(currentUsage.promptTokens || 0)
+          : 0) + tokens,
+      requestEvents: getRecentEvents(currentUsage?.requestEvents, nowTime),
+      tokenEvents:
+        tokens > 0
+          ? [
+              ...getRecentEvents(currentUsage?.tokenEvents, nowTime),
+              { at: now, count: tokens },
+            ]
+          : getRecentEvents(currentUsage?.tokenEvents, nowTime),
+      lastStatus: status,
+      lastType: callType,
+      lastUpdatedAt: now,
+    }));
+    setActiveGeminiCalls((currentCount) => Math.max(0, currentCount - 1));
+  }
+
   async function handleImage(file) {
     if (!file) return;
     if (!ai) {
@@ -492,8 +648,11 @@ export default function App() {
     setSearch("");
     setImagePreview(URL.createObjectURL(file));
 
+    let geminiCallStarted = false;
     try {
       const base64 = await encodeFileToBase64(file);
+      beginGeminiCall("Bookshelf scan");
+      geminiCallStarted = true;
 
       const result = await ai.models.generateContent({
         model: MODEL_NAME,
@@ -564,8 +723,12 @@ Important:
       }
 
       setBooks(parsed.books);
+      finishGeminiCall("Bookshelf scan", "Success", getPromptTokenCount(result));
     } catch (err) {
       console.error("SCAN ERROR:", err);
+      if (geminiCallStarted) {
+        finishGeminiCall("Bookshelf scan", "Failed");
+      }
       setError(
         err?.message ||
           "Could not scan the bookshelf. Try a clearer photo of book spines."
@@ -613,10 +776,6 @@ Important:
     return filteredBooks.filter((book) => !topBookKeys.has(getBookKey(book)));
   }, [filteredBooks, topBooks]);
 
-  function isBookInReadingList(book) {
-    return readingList.some((savedBook) => getBookKey(savedBook) === getBookKey(book));
-  }
-
   function hasSavedPreview(book) {
     return savedFiles.some(
       (file) =>
@@ -633,12 +792,38 @@ Important:
     );
   }
 
+  function isBookInReadingList(book) {
+    return readingList.some(
+      (savedBook) => getBookKey(savedBook) === getBookKey(book)
+    );
+  }
+
+  function toggleReadingList(book) {
+    if (!book) return;
+
+    const exists = isBookInReadingList(book);
+
+    setReadingList((currentList) =>
+      exists
+        ? currentList.filter((savedBook) => getBookKey(savedBook) !== getBookKey(book))
+        : [{ ...book, savedAt: new Date().toISOString() }, ...currentList]
+    );
+
+    setSaveStatus({
+      message: exists
+        ? `${book.title} removed from favorites.`
+        : `${book.title} added to favorites.`,
+      bookKey: getSavedFileKey(book.title, "favorite"),
+      type: "favorite",
+    });
+  }
+
   function getPreviewButtonState(book) {
     const cachedPreview = previewCache[getBookKey(book)];
 
     if (cachedPreview?.status === "ready") {
       return {
-        label: hasSavedPreview(book) ? "Saved Preview" : "Preview",
+        label: hasSavedPreview(book) ? "Saved Preview" : "Preview Available",
         disabled: false,
         saved: hasSavedPreview(book),
       };
@@ -662,9 +847,9 @@ Important:
 
     if (cachedPreview?.status === "error") {
       return {
-        label: hasSavedPreview(book) ? "Saved Preview" : "Preview",
+        label: "No preview available",
         disabled: false,
-        saved: hasSavedPreview(book),
+        saved: false,
       };
     }
 
@@ -675,24 +860,12 @@ Important:
     };
   }
 
-  function addToReadingList(book) {
-    const exists = isBookInReadingList(book);
-
-    if (!exists) {
-      setReadingList([...readingList, book]);
-    }
-
-    setSaveStatus({
-      message: exists
-        ? `${book.title} is already saved as a favorite.`
-        : `${book.title} saved as a favorite.`,
-      bookKey: getSavedFileKey(book.title, "favorite"),
-      type: "favorite",
-    });
-  }
-
-  function removeFromReadingList(title) {
-    setReadingList(readingList.filter((b) => b.title !== title));
+  function updateBookPreviewCache(key, previewResult) {
+    previewCacheRef.current = {
+      ...previewCacheRef.current,
+      [key]: previewResult,
+    };
+    setPreviewCache(previewCacheRef.current);
   }
 
   function deleteSavedBook(savedBook) {
@@ -827,37 +1000,62 @@ Important:
     if (books.length === 0) return;
 
     let cancelled = false;
+    const fallbackTimers = [];
 
     books.forEach((book) => {
       const key = getBookKey(book);
-      if (!key || previewCache[key]) return;
+      const cachedPreview = previewCacheRef.current[key];
+      const loadingAge =
+        cachedPreview?.status === "loading"
+          ? getTimestamp() - Number(cachedPreview.startedAt || 0)
+          : 0;
 
-      setPreviewCache((currentCache) => {
-        if (currentCache[key]) return currentCache;
+      if (
+        !key ||
+        (cachedPreview &&
+          cachedPreview.status !== "loading" &&
+          cachedPreview.status !== "error") ||
+        (cachedPreview?.status === "loading" &&
+          loadingAge < GOOGLE_BOOKS_PREVIEW_STALE_MS)
+      ) {
+        return;
+      }
 
-        return {
-          ...currentCache,
-          [key]: {
-            status: "loading",
-            message: "Checking preview availability...",
-          },
-        };
-      });
+      const loadingPreview = {
+        status: "loading",
+        message: "Checking preview availability...",
+        startedAt: getTimestamp(),
+      };
+
+      updateBookPreviewCache(key, loadingPreview);
+
+      const fallbackTimer = window.setTimeout(() => {
+        if (
+          !cancelled &&
+          previewCacheRef.current[key]?.status === "loading" &&
+          previewCacheRef.current[key]?.startedAt === loadingPreview.startedAt
+        ) {
+          updateBookPreviewCache(key, {
+            status: "unavailable",
+            message: "No preview available",
+          });
+        }
+      }, GOOGLE_BOOKS_PREVIEW_STALE_MS);
+      fallbackTimers.push(fallbackTimer);
 
       findBookPreview(book).then((previewResult) => {
+        window.clearTimeout(fallbackTimer);
         if (cancelled) return;
 
-        setPreviewCache((currentCache) => ({
-          ...currentCache,
-          [key]: previewResult,
-        }));
+        updateBookPreviewCache(key, previewResult);
       });
     });
 
     return () => {
       cancelled = true;
+      fallbackTimers.forEach((timer) => window.clearTimeout(timer));
     };
-  }, [books, findBookPreview, previewCache]);
+  }, [books, findBookPreview]);
 
   async function openPreview(book) {
     if (!book?.title) {
@@ -879,10 +1077,22 @@ Important:
       message: "Loading Google Books preview...",
     });
 
-    if (previewCache[key]) {
+    const cachedPreview = previewCache[key];
+    const cachedPreviewIsFreshLoading =
+      cachedPreview?.status === "loading" &&
+      getTimestamp() - Number(cachedPreview.startedAt || 0) <
+        GOOGLE_BOOKS_PREVIEW_STALE_MS;
+
+    if (
+      cachedPreview &&
+      cachedPreview.status !== "error" &&
+      cachedPreview.status !== "loading"
+    ) {
       setPreviewModal({ book, ...previewCache[key] });
       return;
     }
+
+    if (cachedPreviewIsFreshLoading) return;
 
     let previewResult;
     try {
@@ -923,14 +1133,20 @@ Important:
     };
     const alreadySaved = savedFileIdsRef.current.has(savedKey);
 
-    if (!alreadySaved) {
+    if (alreadySaved) {
+      setSavedFiles((currentFiles) =>
+        currentFiles.map((file) =>
+          file.id === savedKey ? { ...file, ...savedFile } : file
+        )
+      );
+    } else {
       savedFileIdsRef.current.add(savedKey);
       setSavedFiles((currentFiles) => [savedFile, ...currentFiles]);
     }
 
     setSaveStatus({
       message: alreadySaved
-        ? `${displayName || fileName} is already saved on this phone.`
+        ? `Updated ${displayName || fileName} on this phone.`
         : `Saved ${displayName || fileName} on this phone.`,
       bookKey: savedKey,
       type,
@@ -1054,8 +1270,8 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
   function renderBookCard(book, index, options = {}) {
     const theme = getTheme(book);
-    const favoriteSaved = isBookInReadingList(book);
     const previewButton = getPreviewButtonState(book);
+    const favoriteSaved = isBookInReadingList(book);
     const compareSelected = compare.some((selectedBook) => getBookKey(selectedBook) === getBookKey(book));
 
     return (
@@ -1074,7 +1290,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           <span style={styles.cardLens} />
         </div>
 
-        <h3 style={{ color: theme.title, fontSize: "22px", margin: "0 0 10px" }}>{book.title}</h3>
+        <h3 style={{ ...styles.cardTitle, color: theme.title }}>{book.title}</h3>
 
         {options.compact ? (
           <>
@@ -1127,11 +1343,14 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
               <button
                 style={{
                   ...styles.smallButton,
+                  ...styles.iconButton,
                   ...(favoriteSaved ? styles.savedButton : {}),
                 }}
-                onClick={() => addToReadingList(book)}
+                onClick={() => toggleReadingList(book)}
+                aria-label={favoriteSaved ? "Remove favorite" : "Add favorite"}
+                title={favoriteSaved ? "Remove favorite" : "Add favorite"}
               >
-                {favoriteSaved ? "Saved Fav" : "❤️ Save"}
+                ♥
               </button>
 
               <button
@@ -1164,25 +1383,57 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
   function renderSavedFiles(sectionKey) {
     const savedFileBooks = getSavedBookGroups(savedFiles).map((savedBook) => ({
       ...savedBook,
+      preview:
+        previewCache[getBookKey(savedBook.catalogBook)]?.status === "ready"
+          ? previewCache[getBookKey(savedBook.catalogBook)]
+          : savedBook.preview,
+      favorite: false,
       source: "file",
     }));
-    const savedFileBookKeys = new Set(
-      savedFileBooks.map((savedBook) => getBookKey(savedBook.catalogBook))
-    );
-    const favoriteBooks = readingList
-      .filter((book) => !savedFileBookKeys.has(getBookKey(book)))
-      .map((book) => ({
-        id: `favorite-${getBookKey(book)}`,
+    const savedBooksByKey = new Map();
+
+    savedFileBooks.forEach((savedBook) => {
+      const key = getBookKey(savedBook.catalogBook) || savedBook.id;
+      savedBooksByKey.set(key, savedBook);
+    });
+
+    readingList.forEach((book) => {
+      const key = getBookKey(book);
+      const existingSavedBook = savedBooksByKey.get(key);
+
+      if (existingSavedBook) {
+        savedBooksByKey.set(key, {
+          ...existingSavedBook,
+          favorite: true,
+          source: "file-favorite",
+          savedAt:
+            new Date(book.savedAt || 0).getTime() >
+            new Date(existingSavedBook.savedAt || 0).getTime()
+              ? book.savedAt
+              : existingSavedBook.savedAt,
+        });
+        return;
+      }
+
+      savedBooksByKey.set(key, {
+        id: `favorite-${key}`,
+        ids: [],
         bookTitle: book.title,
         catalogBook: book,
-        preview: previewCache[getBookKey(book)]?.status === "ready"
-          ? previewCache[getBookKey(book)]
-          : null,
+        preview:
+          previewCache[getBookKey(book)]?.status === "ready"
+            ? previewCache[getBookKey(book)]
+            : null,
+        favorite: true,
         location: "Favorite",
         savedAt: book.savedAt || new Date().toISOString(),
         source: "favorite",
-      }));
-    const savedBooks = [...savedFileBooks, ...favoriteBooks];
+      });
+    });
+
+    const savedBooks = [...savedBooksByKey.values()].sort(
+      (a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime()
+    );
 
     return (
       <section style={styles.savedFilesSection}>
@@ -1203,7 +1454,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
           <div style={styles.savedFilesHeader}>
             <h2 style={{ ...styles.sectionTitle, marginTop: 0 }}>
-              Saved Books
+              Reading / Saved List
             </h2>
             <span style={styles.fileCountBadge}>{savedBooks.length}</span>
           </div>
@@ -1215,7 +1466,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
         {savedBooks.length === 0 ? (
           <p style={styles.countText}>
-            No saved books yet. Tap Save on a book card, or save preview/details
+            No books yet. Add favorites from Details, or save preview/details
             from a popup.
           </p>
         ) : (
@@ -1237,7 +1488,11 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                     {savedBook.bookTitle}
                   </button>
                   <p style={styles.savedFileMeta}>
-                    {savedBook.location} · {new Date(savedBook.savedAt).toLocaleString()}
+                    {savedBook.favorite ? "Favorite" : "Saved"}
+                    {savedBook.favorite && savedBook.source !== "favorite"
+                      ? " + Saved"
+                      : ""}{" "}
+                    · {new Date(savedBook.savedAt).toLocaleString()}
                   </p>
                 </div>
 
@@ -1255,11 +1510,17 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
                   <button
                     style={styles.deleteButton}
-                    onClick={() =>
-                      savedBook.source === "favorite"
-                        ? removeFromReadingList(savedBook.bookTitle)
-                        : deleteSavedBook(savedBook)
-                    }
+                    onClick={() => {
+                      if (savedBook.source !== "favorite") deleteSavedBook(savedBook);
+                      if (savedBook.favorite) {
+                        setReadingList((currentList) =>
+                          currentList.filter(
+                            (book) =>
+                              getBookKey(book) !== getBookKey(savedBook.catalogBook)
+                          )
+                        );
+                      }
+                    }}
                   >
                     Delete
                   </button>
@@ -1316,6 +1577,70 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     window.setTimeout(() => setSavedArtActive(false), 520);
   }
 
+  function resetPage() {
+    setImagePreview(null);
+    setBooks([]);
+    setSearch("");
+    setLoading(false);
+    setError("");
+    setSelectedBook(null);
+    setCompare([]);
+    setCompareOpen(false);
+    setQuestion("");
+    setAnswer("");
+    setPreviewCache({});
+    previewCacheRef.current = {};
+    setPreviewModal(null);
+    previewRequestId.current += 1;
+    setSaveStatus(null);
+  }
+
+  const recentRequestEvents = getRecentEvents(geminiUsage?.requestEvents);
+  const todayKey = getTodayKey();
+  const geminiRequestBaseline =
+    todayKey === TODAY_SCAN_REQUEST_USAGE_BASELINE.date
+      ? TODAY_SCAN_REQUEST_USAGE_BASELINE.count
+      : 0;
+  const geminiUsageCount =
+    geminiRequestBaseline + Number(geminiUsage?.count || 0);
+  const geminiTokenBaseline =
+    todayKey === TODAY_SCAN_TOKEN_USAGE_BASELINE.date
+      ? TODAY_SCAN_TOKEN_USAGE_BASELINE.count
+      : 0;
+  const geminiDailyPromptTokens =
+    geminiTokenBaseline + Number(geminiUsage?.promptTokens || 0);
+  const geminiDailyTokenLimit = GEMINI_SCAN_DAILY_TOKEN_LIMIT;
+  const geminiMinuteRequests = recentRequestEvents.length;
+  const geminiUsagePercent = Math.min(
+    100,
+    Math.round((geminiUsageCount / GEMINI_DAILY_LIMIT) * 100)
+  );
+  const geminiRpmPercent = Math.min(
+    100,
+    Math.round((geminiMinuteRequests / GEMINI_SCAN_RPM_LIMIT) * 100)
+  );
+  const geminiTpmPercent = Math.min(
+    100,
+    Math.round((geminiDailyPromptTokens / geminiDailyTokenLimit) * 100)
+  );
+  const geminiRemaining = Math.max(0, GEMINI_DAILY_LIMIT - geminiUsageCount);
+  const geminiRpmRemaining = Math.max(
+    0,
+    GEMINI_SCAN_RPM_LIMIT - geminiMinuteRequests
+  );
+  const geminiTpmRemaining = Math.max(
+    0,
+    geminiDailyTokenLimit - geminiDailyPromptTokens
+  );
+  const geminiLiveStatus =
+    activeGeminiCalls > 0 ? "Running" : geminiUsage?.lastStatus || "Idle";
+  const geminiLastType = geminiUsage?.lastType || "No calls yet";
+  const geminiLastUpdated = getDisplayTime(geminiUsage?.lastUpdatedAt);
+  const geminiWarning =
+    geminiUsagePercent >= 90 || geminiRpmPercent >= 90 || geminiTpmPercent >= 90
+      ? "Close to a configured scan limit. Pause before making more scans."
+      : "Within the configured scan limits.";
+
   return (
     <div style={styles.page}>
       <div className="idle-background" aria-hidden="true">
@@ -1355,7 +1680,12 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
       <div style={styles.hero}>
         <div style={styles.heroText}>
-          <div style={styles.brandRow}>
+          <button
+            type="button"
+            style={styles.brandButton}
+            onClick={resetPage}
+            aria-label="Reset Lumina"
+          >
             <div style={styles.brandMark} aria-hidden="true">
               <span style={styles.logoBook} />
               <span style={styles.logoSpine} />
@@ -1363,7 +1693,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
               <span style={styles.logoBeam} />
             </div>
             <h1 style={styles.title}>Lumina</h1>
-          </div>
+          </button>
           <p style={styles.subtitle}>
             Snap a bookshelf and let Lumina guide you to your next favorite
             book. Scan books, discover ratings, and find your next read.
@@ -1397,6 +1727,82 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             onChange={(e) => handleImage(e.target.files[0])}
           />
         </label>
+      </div>
+
+      <div style={styles.devUsageMeter}>
+        <button
+          type="button"
+          style={styles.devUsageToggle}
+          onClick={() => setDevQuotaOpen((isOpen) => !isOpen)}
+          aria-expanded={devQuotaOpen}
+        >
+          <span>Gemini scan quota</span>
+          <span>
+            {geminiDailyPromptTokens.toLocaleString()}/
+            {geminiDailyTokenLimit.toLocaleString()} tokens {devQuotaOpen ? "▲" : "▼"}
+          </span>
+        </button>
+
+        {devQuotaOpen && (
+          <>
+            {[
+              {
+                label: "RPD",
+                value: `${geminiUsageCount}/${GEMINI_DAILY_LIMIT}`,
+                percent: geminiUsagePercent,
+              },
+              {
+                label: "RPM",
+                value: `${geminiMinuteRequests}/${GEMINI_SCAN_RPM_LIMIT}`,
+                percent: geminiRpmPercent,
+              },
+              {
+                label: "Tokens/day",
+                value: `${geminiDailyPromptTokens.toLocaleString()}/${geminiDailyTokenLimit.toLocaleString()}`,
+                percent: geminiTpmPercent,
+              },
+            ].map((meter) => (
+              <div key={meter.label} style={styles.devQuotaRow}>
+                <div style={styles.devQuotaLabelRow}>
+                  <span>{meter.label}</span>
+                  <span>{meter.value}</span>
+                </div>
+                <div style={styles.devUsageTrack} aria-hidden="true">
+                  <span
+                    style={{
+                      ...styles.devUsageFill,
+                      width: `${meter.percent}%`,
+                      ...(meter.percent >= 90
+                        ? styles.devUsageFillWarning
+                        : {}),
+                    }}
+                  />
+                </div>
+              </div>
+            ))}
+            <p style={styles.devUsageText}>
+              {geminiWarning} Left: {geminiRemaining} day, {geminiRpmRemaining}
+              /min, {`${geminiTpmRemaining.toLocaleString()} tokens today`}.
+            </p>
+            <div style={styles.devLiveStatusRow}>
+              <span
+                style={{
+                  ...styles.devStatusDot,
+                  ...(geminiLiveStatus === "Running"
+                    ? styles.devStatusDotRunning
+                    : {}),
+                  ...(geminiLiveStatus === "Failed"
+                    ? styles.devStatusDotFailed
+                    : {}),
+                }}
+              />
+              <span>
+                Live status: {geminiLiveStatus} · Last: {geminiLastType}
+                {geminiLastUpdated ? ` at ${geminiLastUpdated}` : ""}
+              </span>
+            </div>
+          </>
+        )}
       </div>
 
       {imagePreview && (
@@ -1447,7 +1853,9 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             </div>
           )}
 
-          <h2 style={styles.sectionTitle}>📖 Detected Books</h2>
+          <h2 style={{ ...styles.sectionTitle, ...styles.detectedSectionTitle }}>
+            📖 Detected Books
+          </h2>
 
           <p style={styles.countText}>
             Showing {detectedBooks.length} books
@@ -1495,24 +1903,6 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             </button>
           </div>
         </section>
-      )}
-
-      <h2 style={styles.sectionTitle}>❤️ Reading List</h2>
-
-      {readingList.length === 0 ? (
-        <p style={styles.countText}>No saved books yet.</p>
-      ) : (
-        readingList.map((book, index) => (
-          <div key={`${book.title}-saved-${index}`} style={styles.listItem}>
-            <span>📘 {book.title}</span>
-            <button
-              style={styles.removeButton}
-              onClick={() => removeFromReadingList(book.title)}
-            >
-              Remove
-            </button>
-          </div>
-        ))
       )}
 
       {selectedBook &&
@@ -1831,10 +2221,15 @@ const styles = {
     flex: "1 1 260px",
     minWidth: 0,
   },
-  brandRow: {
+  brandButton: {
     display: "flex",
     alignItems: "center",
     gap: "14px",
+    padding: 0,
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    textAlign: "left",
   },
   brandMark: {
     position: "relative",
@@ -1957,6 +2352,90 @@ const styles = {
     fontWeight: "650",
     transition: "background 0.2s",
   },
+  devUsageMeter: {
+    margin: "-12px 0 16px",
+    padding: "8px 10px",
+    borderRadius: "8px",
+    border: "1px dashed rgba(251, 188, 5, 0.5)",
+    background: "rgba(251, 188, 5, 0.08)",
+    color: "#fdd663",
+  },
+  devUsageToggle: {
+    width: "100%",
+    display: "flex",
+    justifyContent: "space-between",
+    gap: "12px",
+    alignItems: "center",
+    padding: 0,
+    background: "transparent",
+    border: "none",
+    color: "#fdd663",
+    cursor: "pointer",
+    fontSize: "12px",
+    fontWeight: "700",
+    textAlign: "left",
+  },
+  devQuotaRow: {
+    marginTop: "6px",
+  },
+  devQuotaLabelRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: "12px",
+    color: "#fff8d7",
+    fontSize: "11px",
+    fontWeight: "800",
+  },
+  devUsageTrack: {
+    position: "relative",
+    height: "5px",
+    marginTop: "4px",
+    overflow: "hidden",
+    borderRadius: "999px",
+    background: "rgba(255, 255, 255, 0.16)",
+  },
+  devUsageFill: {
+    display: "block",
+    height: "100%",
+    borderRadius: "999px",
+    background: "linear-gradient(90deg, #34a853, #fbbc05)",
+    transition: "width 0.2s ease",
+  },
+  devUsageFillWarning: {
+    background: "linear-gradient(90deg, #fbbc05, #ea4335)",
+  },
+  devUsageText: {
+    margin: "6px 0 0",
+    color: "#fbe7a0",
+    fontSize: "11px",
+    lineHeight: 1.3,
+  },
+  devLiveStatusRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    marginTop: "6px",
+    color: "#f8fafd",
+    fontSize: "11px",
+    fontWeight: "650",
+    lineHeight: 1.4,
+  },
+  devStatusDot: {
+    width: "7px",
+    height: "7px",
+    borderRadius: "999px",
+    background: "#34a853",
+    boxShadow: "0 0 0 3px rgba(52, 168, 83, 0.14)",
+    flex: "0 0 auto",
+  },
+  devStatusDotRunning: {
+    background: "#fbbc05",
+    boxShadow: "0 0 0 3px rgba(251, 188, 5, 0.18)",
+  },
+  devStatusDotFailed: {
+    background: "#ea4335",
+    boxShadow: "0 0 0 3px rgba(234, 67, 53, 0.18)",
+  },
   askButton: {
     background: "#34a853",
     color: "#ffffff",
@@ -2023,7 +2502,12 @@ const styles = {
   sectionTitle: {
     color: "#f1f3f4",
     marginTop: "32px",
+    marginBottom: "14px",
     fontWeight: "650",
+    clear: "both",
+  },
+  detectedSectionTitle: {
+    marginTop: "56px",
   },
   countText: {
     color: "#9aa0a6",
@@ -2201,6 +2685,7 @@ const styles = {
   card: {
     display: "flex",
     flexDirection: "column",
+    minWidth: 0,
     borderRadius: "8px",
     padding: "20px",
     boxShadow: "0 16px 36px rgba(0, 0, 0, 0.18)",
@@ -2208,6 +2693,12 @@ const styles = {
     color: "#bdc1c6",
     minHeight: "100%",
     textAlign: "left",
+  },
+  cardTitle: {
+    fontSize: "22px",
+    margin: "0 0 10px",
+    overflowWrap: "anywhere",
+    lineHeight: 1.2,
   },
   bookImage: {
     position: "relative",
@@ -2277,23 +2768,31 @@ const styles = {
   },
   buttonRow: {
     display: "grid",
-    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(112px, 1fr))",
     gap: "8px",
+    alignItems: "stretch",
     marginTop: "auto",
     paddingTop: "16px",
   },
   smallButton: {
     width: "100%",
     minHeight: "38px",
-    padding: "8px 12px",
+    padding: "8px 10px",
     borderRadius: "6px",
     border: "1px solid #3c4043",
     background: "#171717",
     color: "#e8eaed",
     cursor: "pointer",
     fontWeight: "600",
-    fontSize: "14px",
+    fontSize: "13px",
+    lineHeight: 1.2,
+    whiteSpace: "normal",
+    overflowWrap: "anywhere",
     transition: "background 0.2s",
+  },
+  iconButton: {
+    fontSize: "18px",
+    lineHeight: 1,
   },
   savedButton: {
     border: "1px solid rgba(52, 168, 83, 0.44)",
@@ -2310,18 +2809,6 @@ const styles = {
     background: "rgba(154, 160, 166, 0.1)",
     color: "#9aa0a6",
     cursor: "not-allowed",
-  },
-  listItem: {
-    display: "flex",
-    justifyContent: "space-between",
-    gap: "10px",
-    padding: "12px 16px",
-    borderRadius: "8px",
-    background: "#202124",
-    marginBottom: "8px",
-    boxShadow: "0 12px 28px rgba(0, 0, 0, 0.14)",
-    border: "1px solid #34373d",
-    color: "#e8eaed",
   },
   compareTray: {
     display: "flex",
@@ -2381,16 +2868,6 @@ const styles = {
     color: "#e8eaed",
     fontWeight: "800",
     overflowWrap: "anywhere",
-  },
-  removeButton: {
-    border: "none",
-    background: "rgba(234, 67, 53, 0.16)",
-    color: "#f28b82",
-    borderRadius: "6px",
-    padding: "6px 12px",
-    cursor: "pointer",
-    fontWeight: "600",
-    fontSize: "14px",
   },
   modal: {
     position: "fixed",
