@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head><title>Test</title></head>
+<body>
+<div id='root'><p>Initial content</p></div>
+<script type='module'>
+  import { StrictMode } from 'react';
+  import { createRoot } from 'react-dom/client';
+  console.log('Script started');
+  document.getElementById('root').innerHTML = '<h1>React Working!</h1>';
+</script>
+</body>
+</html>

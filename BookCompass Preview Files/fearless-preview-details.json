@@ -1,0 +1,32 @@
+{
+  "savedAt": "2026-06-19T06:34:24.788Z",
+  "catalogBook": {
+    "title": "Fearless",
+    "author": "Francine Pascal",
+    "authorBio": "Francine Pascal is an American author known for her young adult novels, particularly the \"Fear Street\" series.",
+    "rating": 4,
+    "ratingSource": "Estimated",
+    "genre": "Horror",
+    "readingLevel": "Intermediate",
+    "gradeBand": "7+",
+    "ageRecommendation": "Teen",
+    "shelfPick": "Popular",
+    "whyRead": "If you enjoy thrilling and suspenseful horror stories with relatable teenage characters.",
+    "summary": "A suspenseful story about a group of teenagers facing terrifying situations."
+  },
+  "preview": {
+    "status": "ready",
+    "message": "",
+    "embedUrl": "https://books.google.com/books?id=s7gp4tPJDBwC&output=embed&pg=PP1",
+    "googleBooksTitle": "Fearless",
+    "googleBooksAuthors": [
+      "Francine Pascal"
+    ],
+    "googleBooksCategories": [
+      "Ability"
+    ],
+    "googleBooksViewability": "PARTIAL",
+    "googleBooksReaderLink": "http://play.google.com/books/reader?id=s7gp4tPJDBwC&hl=&as_pt=BOOKS&source=gbs_api"
+  },
+  "note": "This file saves BookCompass and Google Books preview metadata. Preview pages are displayed by Google Books and are not downloaded."
+}
