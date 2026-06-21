@@ -1,0 +1,78 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function owns(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function isDeveloper() {
+      return signedIn()
+        && (
+          request.auth.token.email == "shilpispin@gmail.com"
+          || (
+            exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "developer"
+          )
+        );
+    }
+
+    function roleUnchanged(userId) {
+      return !exists(/databases/$(database)/documents/users/$(userId))
+        || !("role" in request.resource.data)
+        || request.resource.data.role == resource.data.role;
+    }
+
+    match /users/{userId} {
+      allow get: if owns(userId) || isDeveloper();
+      allow list: if isDeveloper();
+      allow create: if owns(userId)
+        && !("role" in request.resource.data)
+        && request.resource.data.uid == request.auth.uid;
+      allow update: if owns(userId)
+        && roleUnchanged(userId)
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if owns(userId);
+
+      match /appData/{docId} {
+        allow read, write: if owns(userId);
+      }
+
+      match /scans/{scanId} {
+        allow read, create: if owns(userId) || isDeveloper();
+        allow update, delete: if owns(userId);
+      }
+    }
+
+    match /loginEvents/{eventId} {
+      allow read, list: if isDeveloper();
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.email == request.auth.token.email;
+      allow update, delete: if false;
+    }
+
+    match /developerApiUsage/{dateKey} {
+      allow read: if isDeveloper();
+      allow write: if false;
+    }
+
+    match /developerApiUsageEvents/{eventId} {
+      allow read, list: if isDeveloper();
+      allow write: if false;
+    }
+
+    match /developerStats/{docId} {
+      allow read: if isDeveloper();
+      allow write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "bookcompass-functions",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "scripts": {
+    "lint": "node --check index.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0",
+    "firebase-functions": "^7.2.5"
+  },
+  "overrides": {
+    "uuid": "^14.0.1",
+    "retry-request": "^8.0.3",
+    "teeny-request": "^10.1.3"
+  }
+}

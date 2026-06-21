@@ -1,18 +1,49 @@
 import { useCallback, useMemo, useState, useEffect, useRef } from "react";
-import { GoogleGenAI } from "@google/genai";
-import { analytics, logEvent } from "./firebase";
+import {
+  createUserWithEmailAndPassword,
+  getRedirectResult,
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  reload,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+  updateProfile,
+} from "firebase/auth";
+import { httpsCallable } from "firebase/functions";
+import {
+  addDoc,
+  collection,
+  doc,
+  getCountFromServer,
+  getDoc,
+  getDocs,
+  increment,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  where,
+} from "firebase/firestore";
+import {
+  analytics,
+  auth,
+  cloudFunctions,
+  db,
+  isFirebaseConfigured,
+  logEvent,
+} from "./firebase";
 
-const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
 const googleBooksApiKey = import.meta.env.GOOGLE_BOOKS_API_KEY;
+const firebaseProjectId = import.meta.env.VITE_FIREBASE_PROJECT_ID || "lumina-kaboom";
+const firestoreConsoleUrl = `https://console.firebase.google.com/project/${firebaseProjectId}/firestore/databases/-default-/data/~2Fusers`;
 const configuredGeminiDailyLimit = Number(import.meta.env.VITE_GEMINI_DAILY_LIMIT);
-let ai = null;
-try {
-  if (apiKey) {
-    ai = new GoogleGenAI({ apiKey });
-  }
-} catch (e) {
-  console.warn("GoogleGenAI initialization skipped:", e.message);
-}
+const isGeminiConfigured = isFirebaseConfigured;
 const MODEL_NAME = "gemini-2.5-flash-lite";
 const GOOGLE_BOOKS_PREVIEW_TIMEOUT_MS = 10000;
 const GOOGLE_BOOKS_PREVIEW_STALE_MS = GOOGLE_BOOKS_PREVIEW_TIMEOUT_MS + 3000;
@@ -22,15 +53,216 @@ const GEMINI_DAILY_LIMIT =
     : 1000;
 const GEMINI_SCAN_RPM_LIMIT = 15;
 const GEMINI_SCAN_DAILY_TOKEN_LIMIT = 100000;
-const TODAY_SCAN_TOKEN_USAGE_BASELINE = {
-  date: "2026-06-20",
-  count: 50000,
-};
-const TODAY_SCAN_REQUEST_USAGE_BASELINE = {
-  date: "2026-06-20",
-  count: 20,
-};
 const ONE_MINUTE_MS = 60 * 1000;
+const DEFAULT_FILTERS = {
+  genre: "",
+  gradeBand: "",
+  readingLevel: "",
+  ageRecommendation: "",
+  shelfPick: "",
+  minRating: "",
+};
+const FILTER_OPTIONS = {
+  gradeBand: ["K-3", "4-6", "7+"],
+  readingLevel: ["Easy", "Intermediate", "Advanced"],
+  ageRecommendation: ["Kids", "Young Readers", "Teen", "Adult", "All ages"],
+  shelfPick: [
+    "Top Rated",
+    "Hidden Gem",
+    "Beginner Friendly",
+    "Popular",
+    "Educational",
+  ],
+  minRating: ["3", "3.5", "4", "4.5"],
+};
+const APP_STATE_DOC = "bookCompass";
+const API_USAGE_COLLECTION = "developerApiUsage";
+const MAX_DISPLAY_NAME_LENGTH = 24;
+const BLOCKED_NAME_TERMS = [
+  "admin",
+  "administrator",
+  "firebase",
+  "google",
+  "http",
+  "https",
+  "moderator",
+  "support",
+  "www",
+];
+const DAILY_GUEST_SCAN_LIMIT = 12;
+const DAILY_USER_SCAN_LIMIT = 30;
+const DEVELOPER_EMAILS = ["shilpispin@gmail.com"];
+const DEFAULT_FOLDERS = ["Want to read", "Read aloud", "For kids", "School", "Gift ideas", "Favorites"];
+const LAUNCH_READINESS_ITEMS = [
+  "Delete account flow",
+  "Privacy policy",
+  "Terms of use",
+  "Data deletion page",
+  "AI accuracy disclaimer",
+  "Node 22 Functions upgrade",
+];
+
+function normalizeFilters(filters) {
+  return {
+    ...DEFAULT_FILTERS,
+    ...(filters && typeof filters === "object" ? filters : {}),
+  };
+}
+
+function getUserDisplayName(user) {
+  return sanitizeDisplayName(user?.displayName || user?.email?.split("@")[0]) || "Reader";
+}
+
+function getTimeGreeting(date = new Date()) {
+  const hour = date.getHours();
+
+  if (hour < 12) return "good morning";
+  if (hour < 17) return "good afternoon";
+  if (hour < 22) return "good evening";
+  return "good night";
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function hasDeveloperAccess(user) {
+  return DEVELOPER_EMAILS.includes(String(user?.email || "").toLowerCase());
+}
+
+function sanitizeDisplayName(name) {
+  return String(name || "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_DISPLAY_NAME_LENGTH);
+}
+
+function validatePassword(password) {
+  if (password.length < 8) return "Password must be at least 8 characters.";
+  if (!/[A-Z]/.test(password)) return "Password must include an uppercase letter.";
+  if (!/[0-9]/.test(password)) return "Password must include a number.";
+  if (!/[^A-Za-z0-9]/.test(password)) return "Password must include a special character.";
+
+  return "";
+}
+
+function validateDisplayName(name) {
+  const sanitizedName = sanitizeDisplayName(name);
+  const normalizedName = normalizeBookText(sanitizedName);
+
+  if (!sanitizedName) return "Enter a display name.";
+  if (sanitizedName.length < 3) return "Display name must be at least 3 characters.";
+  if (!/^[a-zA-Z0-9 ]+$/.test(sanitizedName)) {
+    return "Use only letters, numbers, and spaces in your display name.";
+  }
+  if (BLOCKED_NAME_TERMS.some((term) => normalizedName.includes(term))) {
+    return "Choose a different display name.";
+  }
+
+  return "";
+}
+
+function getDailyScanUsageKey(user) {
+  return `scanUsage:${user?.uid || "guest"}:${getTodayKey()}`;
+}
+
+function getDailyScanUsage(user) {
+  return readStoredJson(getDailyScanUsageKey(user), {
+    count: 0,
+    date: getTodayKey(),
+  });
+}
+
+function canStartScan(user) {
+  const usage = getDailyScanUsage(user);
+  const scanLimit = user ? DAILY_USER_SCAN_LIMIT : DAILY_GUEST_SCAN_LIMIT;
+
+  return Number(usage.count || 0) < scanLimit;
+}
+
+function recordLocalScanUsage(user) {
+  const usageKey = getDailyScanUsageKey(user);
+  const usage = getDailyScanUsage(user);
+
+  localStorage.setItem(
+    usageKey,
+    JSON.stringify({
+      date: getTodayKey(),
+      count: Number(usage.count || 0) + 1,
+    })
+  );
+}
+
+function getScanLimitMessage(user) {
+  const scanLimit = user ? DAILY_USER_SCAN_LIMIT : DAILY_GUEST_SCAN_LIMIT;
+
+  return `Daily scan limit reached. ${user ? "" : "Log in for a higher limit. "}Limit: ${scanLimit} scans/day.`;
+}
+
+function getUserAppStateRef(uid) {
+  if (!db || !uid) return null;
+  return doc(db, "users", uid, "appData", APP_STATE_DOC);
+}
+
+async function saveUserAppState(uid, appState) {
+  const appStateRef = getUserAppStateRef(uid);
+  if (!appStateRef) return;
+
+  await setDoc(
+    appStateRef,
+    {
+      ...appState,
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true }
+  );
+}
+
+async function saveUserScan(uid, scanData) {
+  if (!db || !uid) return;
+
+  await addDoc(collection(db, "users", uid, "scans"), {
+    ...scanData,
+    createdAt: serverTimestamp(),
+  });
+}
+
+function getDeveloperUsageRef(dateKey = getTodayKey()) {
+  if (!db) return null;
+  return doc(db, API_USAGE_COLLECTION, dateKey);
+}
+
+async function recordSuccessfulLogin(user, method = "password") {
+  if (!db || !user?.uid) return;
+
+  const userRef = doc(db, "users", user.uid);
+  const now = serverTimestamp();
+
+  await setDoc(
+    userRef,
+    {
+      uid: user.uid,
+      email: user.email || "",
+      displayName: sanitizeDisplayName(getUserDisplayName(user)),
+      emailVerified: Boolean(user.emailVerified),
+      lastLoginAt: now,
+      loginCount: increment(1),
+      provider: method,
+    },
+    { merge: true }
+  );
+
+  await addDoc(collection(db, "loginEvents"), {
+    userId: user.uid,
+    email: user.email || "",
+    displayName: sanitizeDisplayName(getUserDisplayName(user)),
+    method,
+    date: getTodayKey(),
+    createdAtMs: Date.now(),
+    createdAt: now,
+  });
+}
 
 function getTodayKey() {
   return new Intl.DateTimeFormat("en-CA", {
@@ -41,10 +273,9 @@ function getTodayKey() {
   }).format(new Date());
 }
 
-function getInitialGeminiUsage() {
-  const todayKey = getTodayKey();
-  const fallback = {
-    date: todayKey,
+function getDefaultGeminiUsage() {
+  return {
+    date: getTodayKey(),
     count: 0,
     promptTokens: 0,
     requestEvents: [],
@@ -53,23 +284,61 @@ function getInitialGeminiUsage() {
     lastType: "",
     lastUpdatedAt: "",
   };
-  const storedUsage = readStoredJson("geminiDailyUsage", fallback);
+}
 
-  if (storedUsage?.date !== todayKey) return fallback;
+function normalizeGeminiUsage(usage) {
+  const fallback = getDefaultGeminiUsage();
+
+  if (!usage || usage.date !== fallback.date) return fallback;
 
   return {
-    date: todayKey,
-    count: Number(storedUsage?.count || 0),
-    promptTokens: Number(storedUsage?.promptTokens || 0),
-    requestEvents: Array.isArray(storedUsage?.requestEvents)
-      ? storedUsage.requestEvents
-      : [],
-    tokenEvents: Array.isArray(storedUsage?.tokenEvents)
-      ? storedUsage.tokenEvents
-      : [],
-    lastStatus: storedUsage?.lastStatus || "Idle",
-    lastType: storedUsage?.lastType || "",
-    lastUpdatedAt: storedUsage?.lastUpdatedAt || "",
+    date: fallback.date,
+    count: Number(usage.count || 0),
+    promptTokens: Number(usage.promptTokens || 0),
+    requestEvents: Array.isArray(usage.requestEvents) ? usage.requestEvents : [],
+    tokenEvents: Array.isArray(usage.tokenEvents) ? usage.tokenEvents : [],
+    lastStatus: usage.lastStatus || "Idle",
+    lastType: usage.lastType || "",
+    lastUpdatedAt: usage.lastUpdatedAt || "",
+  };
+}
+
+function getInitialGeminiUsage() {
+  return normalizeGeminiUsage(readStoredJson("geminiDailyUsage", getDefaultGeminiUsage()));
+}
+
+function mergeGeminiUsage(cloudUsage, localUsage) {
+  const normalizedCloud = normalizeGeminiUsage(cloudUsage);
+  const normalizedLocal = normalizeGeminiUsage(localUsage);
+  const mergedRequestEvents = Array.from(
+    new Set([
+      ...getRecentEvents(normalizedCloud.requestEvents),
+      ...getRecentEvents(normalizedLocal.requestEvents),
+    ])
+  );
+  const mergedTokenEvents = [
+    ...normalizedCloud.tokenEvents,
+    ...normalizedLocal.tokenEvents,
+  ].filter((event) => {
+    if (!event?.at) return false;
+    return new Date(event.at).getTime() > Date.now() - ONE_MINUTE_MS;
+  });
+  const cloudUpdatedAt = new Date(normalizedCloud.lastUpdatedAt || 0).getTime();
+  const localUpdatedAt = new Date(normalizedLocal.lastUpdatedAt || 0).getTime();
+  const latestUsage = localUpdatedAt > cloudUpdatedAt ? normalizedLocal : normalizedCloud;
+
+  return {
+    date: getTodayKey(),
+    count: Math.max(normalizedCloud.count, normalizedLocal.count),
+    promptTokens: Math.max(
+      normalizedCloud.promptTokens,
+      normalizedLocal.promptTokens
+    ),
+    requestEvents: mergedRequestEvents,
+    tokenEvents: mergedTokenEvents,
+    lastStatus: latestUsage.lastStatus || "Idle",
+    lastType: latestUsage.lastType || "",
+    lastUpdatedAt: latestUsage.lastUpdatedAt || "",
   };
 }
 
@@ -91,13 +360,63 @@ function getRecentEvents(events, now = Date.now()) {
 }
 
 function getPromptTokenCount(result) {
+  return Number(result?.usageMetadata?.promptTokenCount || 0);
+}
+
+function getTotalTokenCount(result) {
   return Number(
-    result?.usageMetadata?.promptTokenCount ||
-      result?.usageMetadata?.totalTokenCount ||
+    result?.usageMetadata?.totalTokenCount ||
+      result?.usageMetadata?.promptTokenCount ||
       0
   );
 }
 
+function getGeminiText(result) {
+  return (
+    result?.text ||
+    result?.candidates?.[0]?.content?.parts?.[0]?.text ||
+    ""
+  );
+}
+
+async function generateGeminiContent(contents, generationConfig = {}, callType = "Gemini call") {
+  if (!cloudFunctions) {
+    throw new Error("Firebase Functions is not configured.");
+  }
+
+  const callable = httpsCallable(cloudFunctions, "generateGeminiContent");
+  const response = await callable({ contents, generationConfig, callType });
+
+  return response.data;
+}
+
+function getFriendlyScanError(error) {
+  const code = String(error?.code || "").toLowerCase();
+  const details = String(error?.details?.message || error?.details || "");
+  const message = String(error?.message || details || "");
+  const lowerMessage = message.toLowerCase();
+
+  if (lowerMessage.includes("failed to fetch") || code.includes("unavailable")) {
+    return "Lumina could not reach the scan service. Check your connection and try again.";
+  }
+  if (lowerMessage.includes("api key") || lowerMessage.includes("key not valid")) {
+    return "Gemini is not configured on the server. Check the Firebase Function secret.";
+  }
+  if (lowerMessage.includes("quota") || lowerMessage.includes("rate limit") || code.includes("resource-exhausted")) {
+    return "Gemini quota or rate limit was reached. Lumina will try Claude fallback when Gemini reports quota exhaustion.";
+  }
+  if (lowerMessage.includes("too large")) {
+    return "That photo is too large. Try a smaller or cropped bookshelf photo.";
+  }
+  if (lowerMessage.includes("permission") || lowerMessage.includes("forbidden") || code.includes("failed-precondition")) {
+    return message || "Gemini rejected this request. Check that the API key allows the Gemini API.";
+  }
+  if (code.includes("internal") && lowerMessage === "internal") {
+    return "The scan service hit an internal error. Try again once; if it repeats, check Firebase Function logs.";
+  }
+
+  return message || "Could not scan the bookshelf. Try a clearer photo of book spines.";
+}
 function getTimestamp() {
   return new Date().getTime();
 }
@@ -524,6 +843,233 @@ function getTheme(book) {
   };
 }
 
+function getBookSearchText(book) {
+  return [
+    book?.title,
+    book?.author,
+    book?.authorBio,
+    book?.genre,
+    book?.summary,
+    book?.shelfPick,
+    book?.readingLevel,
+    book?.gradeBand,
+    book?.ageRecommendation,
+    book?.whyRead,
+    book?.ratingSource,
+    String(book?.rating || ""),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function getSearchIntent(searchText) {
+  const rawSearch = String(searchText || "").toLowerCase();
+  const normalized = normalizeBookText(searchText);
+  const minRatingMatch = normalized.match(
+    /\b(?:rating|rated|stars?)?\s*(?:above|over|at least|more than|greater than)\s*(\d(?:\.\d)?)\b/
+  );
+  const directRatingMatch = normalized.match(
+    /\b(?:rating|rated|stars?)\s*(\d(?:\.\d)?)\b/
+  );
+  const gradeMatch = normalized.match(/\bgrade\s*(\d+)\b/);
+  const minRating = Number(minRatingMatch?.[1] || directRatingMatch?.[1] || 0);
+  const gradeNumber = Number(gradeMatch?.[1] || 0);
+  const gradeBand =
+    rawSearch.includes("k-3") || (gradeNumber > 0 && gradeNumber <= 3)
+      ? "k-3"
+      : rawSearch.includes("4-6") || (gradeNumber >= 4 && gradeNumber <= 6)
+        ? "4-6"
+        : rawSearch.includes("7+") || normalized.includes("teen") || gradeNumber >= 7
+          ? "7+"
+          : "";
+  const ageTerms = ["kids", "young readers", "teen", "adult", "all ages"];
+  const levelTerms = ["easy", "intermediate", "advanced"];
+  const shelfTerms = [
+    "top rated",
+    "hidden gem",
+    "beginner friendly",
+    "popular",
+    "educational",
+  ];
+  const age = ageTerms.find((term) => normalized.includes(normalizeBookText(term))) || "";
+  const readingLevel =
+    levelTerms.find((term) => normalized.includes(term)) ||
+    (normalized.includes("beginner") ? "easy" : "");
+  const shelfPick =
+    shelfTerms.find((term) => normalized.includes(normalizeBookText(term))) ||
+    (normalized.includes("beginner") ? "beginner friendly" : "");
+  const stopWords = new Set([
+    "a",
+    "all",
+    "and",
+    "are",
+    "book",
+    "books",
+    "find",
+    "filter",
+    "for",
+    "give",
+    "i",
+    "in",
+    "is",
+    "list",
+    "me",
+    "of",
+    "please",
+    "recommend",
+    "recommendation",
+    "recommendations",
+    "search",
+    "show",
+    "that",
+    "the",
+    "to",
+    "with",
+  ]);
+  const conditionWords = new Set([
+    "above",
+    "adult",
+    "advanced",
+    "ages",
+    "at",
+    "beginner",
+    "easy",
+    "educational",
+    "friendly",
+    "gem",
+    "grade",
+    "greater",
+    "hidden",
+    "kids",
+    "least",
+    "more",
+    "over",
+    "popular",
+    "rated",
+    "rating",
+    "stars",
+    "teen",
+    "than",
+    "top",
+    "young",
+  ]);
+  const terms = normalized
+    .split(" ")
+    .filter((term) => term.length > 1)
+    .filter((term) => !stopWords.has(term))
+    .filter((term) => !conditionWords.has(term))
+    .filter((term) => !/^\d+(\.\d+)?$/.test(term));
+
+  return {
+    normalized,
+    minRating: Number.isFinite(minRating) ? minRating : 0,
+    gradeBand,
+    age,
+    readingLevel,
+    shelfPick,
+    terms,
+  };
+}
+
+function matchesSearchIntent(book, intent) {
+  const searchText = getBookSearchText(book);
+
+  if (!intent.normalized) return true;
+  if (intent.minRating && Number(book?.rating || 0) < intent.minRating) return false;
+  if (
+    intent.gradeBand &&
+    normalizeBookText(book?.gradeBand) !== normalizeBookText(intent.gradeBand)
+  ) {
+    return false;
+  }
+  if (intent.age && !normalizeBookText(book?.ageRecommendation).includes(intent.age)) {
+    return false;
+  }
+  if (
+    intent.readingLevel &&
+    !normalizeBookText(book?.readingLevel).includes(intent.readingLevel)
+  ) {
+    return false;
+  }
+  if (
+    intent.shelfPick &&
+    !normalizeBookText(book?.shelfPick).includes(normalizeBookText(intent.shelfPick))
+  ) {
+    return false;
+  }
+
+  if (intent.terms.length === 0) return true;
+
+  return intent.terms.every((term) => searchText.includes(term));
+}
+
+function getScanConfidence(book) {
+  const title = String(book?.title || "").trim();
+  const author = String(book?.author || "").trim().toLowerCase();
+  const source = String(book?.ratingSource || "").trim().toLowerCase();
+
+  if (!title || title.length < 4 || author === "unknown") {
+    return { label: "Needs review", reason: "Title or author may need correction." };
+  }
+  if (source === "estimated" || title.split(" ").length < 2) {
+    return { label: "Possible match", reason: "Lumina estimated some details." };
+  }
+  return { label: "High confidence", reason: "Title and metadata look complete." };
+}
+
+function enrichScannedBook(book) {
+  const confidence = getScanConfidence(book);
+
+  return {
+    ...book,
+    scanConfidence: book?.scanConfidence || confidence.label,
+    confidenceReason: book?.confidenceReason || confidence.reason,
+    reviewed: Boolean(book?.reviewed),
+  };
+}
+
+function getContentGuidance(book) {
+  const age = normalizeBookText(book?.ageRecommendation);
+  const level = normalizeBookText(book?.readingLevel);
+  const grade = normalizeBookText(book?.gradeBand);
+
+  if (age.includes("adult")) return "Best reviewed by an adult before sharing with younger readers.";
+  if (age.includes("teen") || grade.includes("7")) return "Good for older readers; skim themes if choosing for a child.";
+  if (level.includes("advanced")) return "May need support for younger or developing readers.";
+  return "Generally approachable for the listed age and level.";
+}
+
+function matchesStructuredFilters(book, filters) {
+  const genre = normalizeBookText(filters.genre);
+  const gradeBand = normalizeBookText(filters.gradeBand);
+  const readingLevel = normalizeBookText(filters.readingLevel);
+  const ageRecommendation = normalizeBookText(filters.ageRecommendation);
+  const shelfPick = normalizeBookText(filters.shelfPick);
+  const minRating = Number(filters.minRating || 0);
+
+  if (genre && !normalizeBookText(book?.genre).includes(genre)) return false;
+  if (gradeBand && normalizeBookText(book?.gradeBand) !== gradeBand) return false;
+  if (
+    readingLevel &&
+    !normalizeBookText(book?.readingLevel).includes(readingLevel)
+  ) {
+    return false;
+  }
+  if (
+    ageRecommendation &&
+    !normalizeBookText(book?.ageRecommendation).includes(ageRecommendation)
+  ) {
+    return false;
+  }
+  if (shelfPick && !normalizeBookText(book?.shelfPick).includes(shelfPick)) {
+    return false;
+  }
+  if (minRating && Number(book?.rating || 0) < minRating) return false;
+
+  return true;
+}
+
 export default function App() {
   useEffect(() => {
     logEvent(analytics, "app_opened");
@@ -532,14 +1078,57 @@ export default function App() {
   const [imagePreview, setImagePreview] = useState(null);
   const [books, setBooks] = useState([]);
   const [search, setSearch] = useState("");
+  const [filters, setFilters] = useState(() =>
+    normalizeFilters(readStoredJson("bookSearchFilters", DEFAULT_FILTERS))
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [currentPage, setCurrentPage] = useState("scan");
+  const [user, setUser] = useState(null);
+  const [authMode, setAuthMode] = useState("signin");
+  const [authForm, setAuthForm] = useState({
+    name: "",
+    email: "",
+    password: "",
+  });
+  const [authMessage, setAuthMessage] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [developerStats, setDeveloperStats] = useState({
+    totalLoginEvents: 0,
+    todayLoginEvents: 0,
+    recentUniqueUsers: 0,
+    registeredUsers: 0,
+    lastLoginEmail: "",
+    lastLoginMethod: "",
+    lastLoginAt: "",
+  });
+  const [developerUsage, setDeveloperUsage] = useState({
+    apiCalls: 0,
+    promptTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    successCalls: 0,
+    failedCalls: 0,
+    lastCallType: "",
+    lastStatus: "",
+    lastProvider: "",
+    lastModel: "",
+    lastUserEmail: "",
+  });
+  const [developerStatsStatus, setDeveloperStatsStatus] = useState(
+    isFirebaseConfigured ? "Loading Firebase stats..." : "Firebase is not configured yet."
+  );
+  const userDataLoadedRef = useRef(false);
 
   const [readingList, setReadingList] = useState(() => {
     return readStoredJson("readingList", []);
   });
 
   const [selectedBook, setSelectedBook] = useState(null);
+  const [scanHistory, setScanHistory] = useState(() => readStoredJson("scanHistory", []));
+  const [folders, setFolders] = useState(() => readStoredJson("bookFoldersList", DEFAULT_FOLDERS));
+  const [bookFolders, setBookFolders] = useState(() => readStoredJson("bookFolderAssignments", {}));
+  const [activeFolder, setActiveFolder] = useState("All");
   const [compare, setCompare] = useState([]);
   const [compareOpen, setCompareOpen] = useState(false);
   const [question, setQuestion] = useState("");
@@ -554,10 +1143,23 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState(null);
   const [idleBursts, setIdleBursts] = useState([]);
   const [savedArtActive, setSavedArtActive] = useState(false);
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState("");
+  const recognitionRef = useRef(null);
   const [savedFiles, setSavedFiles] = useState(() => {
     return normalizeSavedFiles(readStoredJson("savedPreviewFiles", []));
   });
   const savedFileIdsRef = useRef(new Set(savedFiles.map((file) => file.id)));
+  const localUserStateRef = useRef({
+    readingList,
+    savedFiles,
+    filters,
+    books,
+    geminiUsage,
+    scanHistory,
+    folders,
+    bookFolders,
+  });
 
   useEffect(() => {
     localStorage.setItem("readingList", JSON.stringify(readingList));
@@ -573,8 +1175,292 @@ export default function App() {
   }, [geminiUsage]);
 
   useEffect(() => {
+    localStorage.setItem("bookSearchFilters", JSON.stringify(filters));
+  }, [filters]);
+
+  useEffect(() => {
+    localStorage.setItem("scanHistory", JSON.stringify(scanHistory));
+  }, [scanHistory]);
+
+  useEffect(() => {
+    localStorage.setItem("bookFoldersList", JSON.stringify(folders));
+  }, [folders]);
+
+  useEffect(() => {
+    localStorage.setItem("bookFolderAssignments", JSON.stringify(bookFolders));
+  }, [bookFolders]);
+
+  useEffect(() => {
+    localUserStateRef.current = {
+      readingList,
+      savedFiles,
+      filters,
+      books,
+      geminiUsage,
+    };
+  }, [readingList, savedFiles, filters, books, geminiUsage, scanHistory, folders, bookFolders]);
+
+  useEffect(() => {
+    if (!auth || !db) {
+      return undefined;
+    }
+
+    return onAuthStateChanged(auth, async (firebaseUser) => {
+      setUser(firebaseUser);
+      userDataLoadedRef.current = false;
+
+      if (!firebaseUser) return;
+
+      try {
+        const userRef = doc(db, "users", firebaseUser.uid);
+        await setDoc(
+          userRef,
+          {
+            uid: firebaseUser.uid,
+            email: firebaseUser.email || "",
+            displayName: sanitizeDisplayName(getUserDisplayName(firebaseUser)),
+            emailVerified: Boolean(firebaseUser.emailVerified),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+        const appStateRef = getUserAppStateRef(firebaseUser.uid);
+        const appStateSnapshot = appStateRef ? await getDoc(appStateRef) : null;
+        const cloudState = appStateSnapshot?.exists()
+          ? appStateSnapshot.data()
+          : null;
+
+        if (cloudState) {
+          setReadingList(
+            Array.isArray(cloudState.readingList) ? cloudState.readingList : []
+          );
+          setSavedFiles(normalizeSavedFiles(cloudState.savedFiles || []));
+          setFilters(normalizeFilters(cloudState.filters));
+          setBooks(Array.isArray(cloudState.books) ? cloudState.books.map(enrichScannedBook) : []);
+          setScanHistory(Array.isArray(cloudState.scanHistory) ? cloudState.scanHistory : []);
+          setFolders(Array.isArray(cloudState.folders) && cloudState.folders.length ? cloudState.folders : DEFAULT_FOLDERS);
+          setBookFolders(cloudState.bookFolders && typeof cloudState.bookFolders === "object" ? cloudState.bookFolders : {});
+          setGeminiUsage(
+            mergeGeminiUsage(
+              cloudState.geminiUsage,
+              localUserStateRef.current.geminiUsage
+            )
+          );
+        } else {
+          await saveUserAppState(firebaseUser.uid, localUserStateRef.current);
+        }
+
+        userDataLoadedRef.current = true;
+      } catch (err) {
+        console.error("Could not load user app data:", err);
+        userDataLoadedRef.current = true;
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!auth || !db) return undefined;
+
+    let isMounted = true;
+
+    getRedirectResult(auth)
+      .then(async (credential) => {
+        if (!credential?.user || !isMounted) return;
+
+        await recordSuccessfulLogin(credential.user, "google");
+        logEvent(analytics, "login", { method: "google-redirect" });
+        setAuthMessage("Signed in with Google.");
+        setCurrentPage("scan");
+      })
+      .catch((err) => {
+        console.error("Google redirect sign-in failed:", err);
+        if (isMounted) {
+          setAuthMessage(getAuthErrorMessage(err));
+          setCurrentPage("account");
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!user?.uid || !userDataLoadedRef.current) {
+      return undefined;
+    }
+
+    const saveTimer = window.setTimeout(() => {
+      saveUserAppState(user.uid, {
+        readingList,
+        savedFiles,
+        filters,
+        books,
+        geminiUsage,
+        scanHistory,
+        folders,
+        bookFolders,
+      }).catch((err) => {
+        console.error("Could not save user app data:", err);
+      });
+    }, 500);
+
+    return () => window.clearTimeout(saveTimer);
+  }, [user, readingList, savedFiles, filters, books, geminiUsage, scanHistory, folders, bookFolders]);
+
+  useEffect(() => {
+    if (!db || !hasDeveloperAccess(user)) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    async function loadDeveloperStats() {
+      try {
+        const todayKey = getTodayKey();
+        const userCountSnapshot = await getCountFromServer(collection(db, "users"));
+        const totalLoginSnapshot = await getCountFromServer(collection(db, "loginEvents"));
+        const todayLoginQuery = query(
+          collection(db, "loginEvents"),
+          where("date", "==", todayKey)
+        );
+        const todayLoginSnapshot = await getCountFromServer(todayLoginQuery);
+        const recentLoginQuery = query(
+          collection(db, "loginEvents"),
+          orderBy("createdAtMs", "desc"),
+          limit(50)
+        );
+        const recentLoginSnapshot = await getDocs(recentLoginQuery);
+        const recentLogins = recentLoginSnapshot.docs.map((eventDoc) => eventDoc.data());
+        const lastLogin = recentLogins[0] || {};
+        const recentUniqueUsers = new Set(
+          recentLogins.map((loginEvent) => loginEvent.userId).filter(Boolean)
+        ).size;
+
+        if (cancelled) return;
+
+        setDeveloperStats({
+          totalLoginEvents: totalLoginSnapshot.data().count || 0,
+          todayLoginEvents: todayLoginSnapshot.data().count || 0,
+          recentUniqueUsers,
+          registeredUsers: userCountSnapshot.data().count || 0,
+          lastLoginEmail: lastLogin.email || "",
+          lastLoginMethod: lastLogin.method || "",
+          lastLoginAt: lastLogin.createdAtMs
+            ? new Date(lastLogin.createdAtMs).toISOString()
+            : "",
+        });
+        setDeveloperStatsStatus("Showing Firebase login analytics from recent auth events.");
+      } catch (err) {
+        console.error("Could not load developer stats:", err);
+        if (!cancelled) {
+          setDeveloperStatsStatus("Could not load Firebase developer stats.");
+        }
+      }
+    }
+
+    loadDeveloperStats();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (!db || !hasDeveloperAccess(user)) {
+      return undefined;
+    }
+
+    const usageRef = getDeveloperUsageRef();
+    if (!usageRef) return undefined;
+
+    return onSnapshot(
+      usageRef,
+      (snapshot) => {
+        const data = snapshot.exists() ? snapshot.data() : {};
+        setDeveloperUsage({
+          apiCalls: Number(data.apiCalls || 0),
+          promptTokens: Number(data.promptTokens || 0),
+          outputTokens: Number(data.outputTokens || 0),
+          totalTokens: Number(data.totalTokens || 0),
+          successCalls: Number(data.successCalls || 0),
+          failedCalls: Number(data.failedCalls || 0),
+          lastCallType: data.lastCallType || "",
+          lastStatus: data.lastStatus || "",
+          lastProvider: data.lastProvider || "",
+          lastModel: data.lastModel || "",
+          lastUserEmail: data.lastUserEmail || "",
+        });
+      },
+      (err) => {
+        console.error("Could not load developer API usage:", err);
+      }
+    );
+  }, [user]);
+
+  useEffect(() => {
+    if (!db || !hasDeveloperAccess(user)) {
+      return undefined;
+    }
+
+    const todayEventsQuery = query(
+      collection(db, "developerApiUsageEvents"),
+      where("date", "==", getTodayKey())
+    );
+
+    return onSnapshot(
+      todayEventsQuery,
+      (snapshot) => {
+        const eventTotals = snapshot.docs.reduce(
+          (totals, eventDoc) => {
+            const eventData = eventDoc.data();
+            const promptTokens = Number(eventData.promptTokens || 0);
+            const totalTokens = Number(eventData.totalTokens || promptTokens);
+            const outputTokens = Number(
+              eventData.outputTokens ?? Math.max(0, totalTokens - promptTokens)
+            );
+
+            return {
+              apiCalls: totals.apiCalls + 1,
+              promptTokens: totals.promptTokens + promptTokens,
+              outputTokens: totals.outputTokens + outputTokens,
+              totalTokens: totals.totalTokens + totalTokens,
+              successCalls:
+                totals.successCalls + (eventData.status === "Success" ? 1 : 0),
+              failedCalls:
+                totals.failedCalls + (eventData.status === "Success" ? 0 : 1),
+            };
+          },
+          {
+            apiCalls: 0,
+            promptTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            successCalls: 0,
+            failedCalls: 0,
+          }
+        );
+
+        setDeveloperUsage((currentUsage) => ({
+          ...currentUsage,
+          ...eventTotals,
+        }));
+      },
+      (err) => {
+        console.error("Could not load developer API usage events:", err);
+      }
+    );
+  }, [user]);
+
+  useEffect(() => {
     previewCacheRef.current = previewCache;
   }, [previewCache]);
+
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.abort();
+    };
+  }, []);
 
   function beginGeminiCall(callType) {
     const todayKey = getTodayKey();
@@ -604,11 +1490,11 @@ export default function App() {
     setActiveGeminiCalls((currentCount) => currentCount + 1);
   }
 
-  function finishGeminiCall(callType, status, promptTokenCount = 0) {
+  function finishGeminiCall(callType, status, tokenCount = 0) {
     const todayKey = getTodayKey();
     const now = new Date().toISOString();
     const nowTime = new Date(now).getTime();
-    const tokens = Number(promptTokenCount || 0);
+    const tokens = Number(tokenCount || 0);
 
     setGeminiUsage((currentUsage) => ({
       date: todayKey,
@@ -633,10 +1519,279 @@ export default function App() {
     setActiveGeminiCalls((currentCount) => Math.max(0, currentCount - 1));
   }
 
+  function updateAuthForm(field, value) {
+    setAuthForm((currentForm) => ({
+      ...currentForm,
+      [field]: value,
+    }));
+    setAuthMessage("");
+  }
+
+  function getAuthErrorMessage(err) {
+    const code = err?.code || "";
+
+    if (code.includes("invalid-credential")) return "Email or password is incorrect.";
+    if (code.includes("email-already-in-use")) return "That email already has an account.";
+    if (code.includes("user-not-found")) return "No password account was found for that email.";
+    if (code.includes("weak-password")) return "Use a stronger password.";
+    if (code.includes("too-many-requests")) return "Too many attempts. Wait a few minutes, then try again.";
+    if (code.includes("missing-email")) return "Enter your email address first.";
+    if (code.includes("invalid-email")) return "Enter a valid email address.";
+    if (code.includes("popup-closed-by-user")) return "Google sign-in was closed.";
+    if (code.includes("configuration-not-found")) {
+      return "Firebase Authentication is not enabled for this project yet. In Firebase, open Authentication, click Get started, then enable Google and Email/Password sign-in.";
+    }
+    if (code.includes("popup-blocked")) {
+      return "The browser blocked the Google pop-up. Trying redirect sign-in...";
+    }
+    if (code.includes("operation-not-allowed")) {
+      return "Google sign-in is not enabled in Firebase yet. Enable Google under Authentication > Sign-in method.";
+    }
+    if (code.includes("unauthorized-domain")) {
+      return "This app URL is not authorized in Firebase. Add 127.0.0.1 and localhost under Authentication > Settings > Authorized domains.";
+    }
+    if (code.includes("network-request-failed")) {
+      return "Firebase could not connect. Check your internet connection and try again.";
+    }
+
+    return err?.message || "Authentication failed. Please try again.";
+  }
+
+  async function handleAuthSubmit(event) {
+    event.preventDefault();
+
+    if (!auth || !db) {
+      setAuthMessage("Add your Firebase config and enable Authentication first.");
+      return;
+    }
+
+    const email = authForm.email.trim().toLowerCase();
+    const password = authForm.password;
+    const displayName = sanitizeDisplayName(authForm.name);
+
+    if (!email || !password) {
+      setAuthMessage("Enter your email and password.");
+      return;
+    }
+    if (!isValidEmail(email)) {
+      setAuthMessage("Enter a valid email address.");
+      return;
+    }
+    if (authMode === "signup") {
+      const nameError = validateDisplayName(displayName);
+      if (nameError) {
+        setAuthMessage(nameError);
+        return;
+      }
+      const passwordError = validatePassword(password);
+      if (passwordError) {
+        setAuthMessage(passwordError);
+        return;
+      }
+    }
+
+    setAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      const credential =
+        authMode === "signup"
+          ? await createUserWithEmailAndPassword(auth, email, password)
+          : await signInWithEmailAndPassword(auth, email, password);
+
+      if (authMode === "signup") {
+        await updateProfile(credential.user, {
+          displayName,
+        });
+        await sendEmailVerification(credential.user);
+      }
+
+      await recordSuccessfulLogin(
+        {
+          ...credential.user,
+          displayName: displayName || credential.user.displayName,
+        },
+        authMode === "signup" ? "email-signup" : "email"
+      );
+      logEvent(analytics, authMode === "signup" ? "sign_up" : "login", {
+        method: "email",
+      });
+      setAuthMessage(
+        authMode === "signup"
+          ? "Account created. Check your email to verify your account."
+          : credential.user.emailVerified
+            ? "Signed in. Your saved list and filters will sync here."
+            : "Signed in. Please verify your email for full account protection."
+      );
+      setCurrentPage("scan");
+    } catch (err) {
+      console.error("Auth failed:", err);
+      setAuthMessage(getAuthErrorMessage(err));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleGoogleLogin() {
+    if (!auth || !db) {
+      setAuthMessage("Add your Firebase config and enable Authentication first.");
+      return;
+    }
+
+    setAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({
+        prompt: "select_account",
+      });
+      const credential = await signInWithPopup(auth, provider);
+      await recordSuccessfulLogin(credential.user, "google");
+      logEvent(analytics, "login", { method: "google" });
+      setAuthMessage("Signed in with Google.");
+      setCurrentPage("scan");
+    } catch (err) {
+      console.error("Google sign-in failed:", err);
+      const code = err?.code || "";
+      if (
+        code.includes("popup-blocked") ||
+        code.includes("popup-closed-by-user") ||
+        code.includes("cancelled-popup-request") ||
+        code.includes("web-storage-unsupported")
+      ) {
+        setAuthMessage("Opening Google sign-in in this tab...");
+        const provider = new GoogleAuthProvider();
+        provider.setCustomParameters({
+          prompt: "select_account",
+        });
+        await signInWithRedirect(auth, provider);
+        return;
+      }
+
+      setAuthMessage(getAuthErrorMessage(err));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleForgotPassword() {
+    if (!auth) {
+      setAuthMessage("Add your Firebase config and enable Authentication first.");
+      return;
+    }
+
+    const email = authForm.email.trim().toLowerCase();
+    if (!email) {
+      setAuthMessage("Enter your email first, then click Forgot password.");
+      return;
+    }
+    if (!isValidEmail(email)) {
+      setAuthMessage("Enter a valid email address for password reset.");
+      return;
+    }
+
+    setAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      await sendPasswordResetEmail(auth, email, {
+        url: window.location.origin,
+        handleCodeInApp: false,
+      });
+      setAuthMessage(
+        `Password reset email sent to ${email}. Check spam or promotions if it does not show up in a minute.`
+      );
+    } catch (err) {
+      console.error("Password reset failed:", err);
+      setAuthMessage(getAuthErrorMessage(err));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleResendVerification() {
+    if (!user) {
+      setAuthMessage("Log in first, then request a verification email.");
+      return;
+    }
+    if (user.emailVerified) {
+      setAuthMessage("Your email is already verified.");
+      return;
+    }
+
+    setAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      await sendEmailVerification(user);
+      setAuthMessage("Verification email sent. Check your inbox.");
+    } catch (err) {
+      console.error("Email verification failed:", err);
+      setAuthMessage(getAuthErrorMessage(err));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleRefreshVerification() {
+    if (!auth?.currentUser) return;
+
+    setAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      await reload(auth.currentUser);
+      const refreshedUser = auth.currentUser;
+      setUser(refreshedUser);
+      if (refreshedUser?.uid && db) {
+        await setDoc(
+          doc(db, "users", refreshedUser.uid),
+          {
+            emailVerified: Boolean(refreshedUser.emailVerified),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+      setAuthMessage(
+        refreshedUser?.emailVerified
+          ? "Email verified. Thank you."
+          : "Email is not verified yet."
+      );
+    } catch (err) {
+      console.error("Refresh verification failed:", err);
+      setAuthMessage("Could not refresh verification status.");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleSignOut() {
+    if (!auth) return;
+
+    try {
+      await signOut(auth);
+      setAuthMessage("Signed out. You can keep browsing as a guest.");
+    } catch (err) {
+      console.error("Sign out failed:", err);
+      setAuthMessage("Could not sign out. Please try again.");
+    }
+  }
+
   async function handleImage(file) {
     if (!file) return;
-    if (!ai) {
-      setError("Gemini API key is not configured. Please add VITE_GEMINI_API_KEY to your .env file.");
+    if (!isGeminiConfigured) {
+      setError("Firebase is not configured yet.");
+      return;
+    }
+    if (!user?.uid) {
+      setError("Sign in to scan books with Gemini.");
+      setCurrentPage("account");
+      return;
+    }
+    if (!canStartScan(user)) {
+      setError(getScanLimitMessage(user));
       return;
     }
 
@@ -646,22 +1801,24 @@ export default function App() {
     setPreviewCache({});
     setAnswer("");
     setSearch("");
+    setVoiceStatus("");
+    setVoiceListening(false);
+    recognitionRef.current?.abort();
     setImagePreview(URL.createObjectURL(file));
 
     let geminiCallStarted = false;
     try {
       const base64 = await encodeFileToBase64(file);
+      recordLocalScanUsage(user);
       beginGeminiCall("Bookshelf scan");
       geminiCallStarted = true;
 
-      const result = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                text: `
+      const result = await generateGeminiContent([
+        {
+          role: "user",
+          parts: [
+            {
+              text: `
 You are a smart library bookshelf assistant.
 
 Look at this bookshelf image. Detect visible book titles as best as possible.
@@ -695,26 +1852,26 @@ Important:
   - K-3 for grade 3 and below
   - 4-6 for grade 4 to grade 6
   - 7+ for grade 7 and above or teen/adult books
+- Include at most 12 books.
 - Do not invent too many books.
 - Only include books you can reasonably detect.
 - Keep summaries short.
                 `,
+            },
+            {
+              inlineData: {
+                mimeType: file.type || "image/jpeg",
+                data: base64,
               },
-              {
-                inlineData: {
-                  mimeType: file.type,
-                  data: base64,
-                },
-              },
-            ],
-          },
-        ],
-      });
+            },
+          ],
+        },
+      ], {
+        maxOutputTokens: 4096,
+        responseMimeType: "application/json",
+      }, "Bookshelf scan");
 
-      const text =
-        result.text ||
-        result.candidates?.[0]?.content?.parts?.[0]?.text ||
-        "";
+      const text = getGeminiText(result);
 
       const parsed = safeParseJson(text);
 
@@ -722,48 +1879,148 @@ Important:
         throw new Error("No books returned from Gemini");
       }
 
-      setBooks(parsed.books);
-      finishGeminiCall("Bookshelf scan", "Success", getPromptTokenCount(result));
+      const scannedBooks = parsed.books.map(enrichScannedBook);
+      const promptTokenCount = getPromptTokenCount(result);
+      const totalTokenCount = getTotalTokenCount(result);
+      const scanEntry = {
+        id: `scan-${Date.now()}`,
+        createdAt: new Date().toISOString(),
+        imageName: file.name || "bookshelf image",
+        bookCount: scannedBooks.length,
+        provider: result.provider || "gemini",
+        model: result.model || MODEL_NAME,
+        promptTokens: promptTokenCount,
+        totalTokens: totalTokenCount,
+        books: scannedBooks,
+      };
+      setBooks(scannedBooks);
+      setScanHistory((currentHistory) => [scanEntry, ...currentHistory].slice(0, 30));
+      if (user?.uid) {
+        await saveUserScan(user.uid, {
+          books: scannedBooks,
+          bookCount: scannedBooks.length,
+          filters,
+          image: {
+            name: file.name || "bookshelf image",
+            type: file.type || "image/jpeg",
+            size: Number(file.size || 0),
+          },
+          model: result.model || MODEL_NAME,
+          provider: result.provider || "gemini",
+          promptTokens: promptTokenCount,
+          totalTokens: totalTokenCount,
+          scannedAtLocalDate: getTodayKey(),
+        });
+      }
+      finishGeminiCall("Bookshelf scan", "Success", totalTokenCount);
     } catch (err) {
       console.error("SCAN ERROR:", err);
       if (geminiCallStarted) {
         finishGeminiCall("Bookshelf scan", "Failed");
       }
-      setError(
-        err?.message ||
-          "Could not scan the bookshelf. Try a clearer photo of book spines."
-      );
+      setError(getFriendlyScanError(err));
     } finally {
       setLoading(false);
     }
   }
 
-  const filteredBooks = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return books;
+  function handleVoiceSearch() {
+    if (voiceListening) {
+      recognitionRef.current?.stop();
+      setVoiceListening(false);
+      setVoiceStatus("Voice search stopped.");
+      return;
+    }
 
-    return books.filter((book) => {
-      const searchableText = [
-        book.title,
-        book.author,
-        book.authorBio,
-        book.genre,
-        book.summary,
-        book.shelfPick,
-        book.readingLevel,
-        book.gradeBand,
-        book.ageRecommendation,
-        book.whyRead,
-        book.ratingSource,
-        String(book.rating || ""),
-      ]
-        .filter(Boolean)
+    const SpeechRecognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      setVoiceStatus("Voice search is not supported in this browser.");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+    recognition.lang = "en-US";
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setVoiceListening(true);
+      setVoiceStatus("Listening...");
+      setError("");
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0]?.transcript || "")
         .join(" ")
-        .toLowerCase();
+        .trim();
 
-      return searchableText.includes(q);
-    });
-  }, [books, search]);
+      if (!transcript) {
+        setVoiceStatus("I did not catch that. Try again.");
+        return;
+      }
+
+      setSearch(transcript);
+      setVoiceStatus(`Voice searched: "${transcript}"`);
+    };
+
+    recognition.onerror = (event) => {
+      const blocked = event.error === "not-allowed" || event.error === "service-not-allowed";
+      setVoiceStatus(
+        blocked
+          ? "Microphone permission is needed for voice search."
+          : "Voice search could not hear you. Try again."
+      );
+      setVoiceListening(false);
+    };
+
+    recognition.onend = () => {
+      setVoiceListening(false);
+    };
+
+    try {
+      recognition.start();
+    } catch (err) {
+      console.error("Voice search failed:", err);
+      setVoiceListening(false);
+      setVoiceStatus("Voice search could not start. Try again.");
+    }
+  }
+
+  const genreOptions = useMemo(() => {
+    return [...new Set(books.map((book) => book.genre).filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b));
+  }, [books]);
+
+  const activeFilterCount = useMemo(() => {
+    return Object.values(filters).filter(Boolean).length + (search.trim() ? 1 : 0);
+  }, [filters, search]);
+
+  function updateFilter(filterName, value) {
+    setFilters((currentFilters) => ({
+      ...currentFilters,
+      [filterName]: value,
+    }));
+  }
+
+  function clearFilters() {
+    setFilters({ ...DEFAULT_FILTERS });
+    setSearch("");
+  }
+
+  const filteredBooks = useMemo(() => {
+    const intent = getSearchIntent(search);
+
+    return books.filter(
+      (book) =>
+        matchesStructuredFilters(book, filters) &&
+        matchesSearchIntent(book, intent)
+    );
+  }, [books, filters, search]);
 
   const topBooks = useMemo(() => {
     return [...filteredBooks]
@@ -802,12 +2059,22 @@ Important:
     if (!book) return;
 
     const exists = isBookInReadingList(book);
+    const bookKey = getBookKey(book);
 
     setReadingList((currentList) =>
       exists
-        ? currentList.filter((savedBook) => getBookKey(savedBook) !== getBookKey(book))
+        ? currentList.filter((savedBook) => getBookKey(savedBook) !== bookKey)
         : [{ ...book, savedAt: new Date().toISOString() }, ...currentList]
     );
+
+    setBookFolders((currentFolders) => {
+      if (exists) {
+        const nextFolders = { ...currentFolders };
+        delete nextFolders[bookKey];
+        return nextFolders;
+      }
+      return { ...currentFolders, [bookKey]: currentFolders[bookKey] || "Want to read" };
+    });
 
     setSaveStatus({
       message: exists
@@ -816,6 +2083,49 @@ Important:
       bookKey: getSavedFileKey(book.title, "favorite"),
       type: "favorite",
     });
+  }
+
+  function assignBookFolder(book, folderName) {
+    const bookKey = getBookKey(book);
+    if (!bookKey) return;
+
+    setBookFolders((currentFolders) => ({
+      ...currentFolders,
+      [bookKey]: folderName,
+    }));
+  }
+
+  function markBookReviewed(book) {
+    const bookKey = getBookKey(book);
+    if (!bookKey) return;
+
+    const markReviewed = (candidateBook) =>
+      getBookKey(candidateBook) === bookKey
+        ? { ...candidateBook, reviewed: true, scanConfidence: "Reviewed" }
+        : candidateBook;
+
+    setBooks((currentBooks) => currentBooks.map(markReviewed));
+    setReadingList((currentList) => currentList.map(markReviewed));
+    setSelectedBook((currentBook) =>
+      currentBook && getBookKey(currentBook) === bookKey ? markReviewed(currentBook) : currentBook
+    );
+  }
+
+  function editBookTitle(book) {
+    const bookKey = getBookKey(book);
+    const nextTitle = window.prompt("Correct book title", book?.title || "");
+    if (!bookKey || !nextTitle?.trim()) return;
+
+    const updateTitle = (candidateBook) =>
+      getBookKey(candidateBook) === bookKey
+        ? { ...candidateBook, title: nextTitle.trim(), reviewed: true, scanConfidence: "Reviewed" }
+        : candidateBook;
+
+    setBooks((currentBooks) => currentBooks.map(updateTitle));
+    setReadingList((currentList) => currentList.map(updateTitle));
+    setSelectedBook((currentBook) =>
+      currentBook && getBookKey(currentBook) === bookKey ? updateTitle(currentBook) : currentBook
+    );
   }
 
   function getPreviewButtonState(book) {
@@ -1221,8 +2531,13 @@ Important:
   }
 
   async function askLibrarian() {
-    if (!ai) {
-      setAnswer("Gemini API key is not configured. Please add VITE_GEMINI_API_KEY to your .env file.");
+    if (!isGeminiConfigured) {
+      setAnswer("Firebase is not configured yet.");
+      return;
+    }
+    if (!user?.uid) {
+      setAnswer("Sign in to ask the AI Librarian.");
+      setCurrentPage("account");
       return;
     }
     if (!question.trim()) {
@@ -1238,10 +2553,16 @@ Important:
     setLoading(true);
     setAnswer("");
 
+    let geminiCallStarted = false;
     try {
-      const result = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: `
+      beginGeminiCall("AI Librarian");
+      geminiCallStarted = true;
+      const result = await generateGeminiContent([
+        {
+          role: "user",
+          parts: [
+            {
+              text: `
 You are a friendly AI librarian for kids, families, and teens.
 
 Books detected:
@@ -1252,17 +2573,22 @@ ${question}
 
 Answer in a cheerful, helpful, short way. Recommend books only from the detected list.
         `,
-      });
+            },
+          ],
+        },
+      ], {}, "AI Librarian");
 
-      const text =
-        result.text ||
-        result.candidates?.[0]?.content?.parts?.[0]?.text ||
-        "";
+      const text = getGeminiText(result);
 
+      finishGeminiCall("AI Librarian", "Success", getTotalTokenCount(result));
+      geminiCallStarted = false;
       setAnswer(text);
     } catch (err) {
       console.error("AI Librarian error:", err);
-      setAnswer("Sorry, I could not answer that question right now.");
+      if (geminiCallStarted) {
+        finishGeminiCall("AI Librarian", "Failed");
+      }
+      setAnswer(getFriendlyScanError(err));
     } finally {
       setLoading(false);
     }
@@ -1273,6 +2599,8 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     const previewButton = getPreviewButtonState(book);
     const favoriteSaved = isBookInReadingList(book);
     const compareSelected = compare.some((selectedBook) => getBookKey(selectedBook) === getBookKey(book));
+    const confidence = book.scanConfidence || getScanConfidence(book).label;
+    const folderName = bookFolders[getBookKey(book)] || "Want to read";
 
     return (
       <div
@@ -1291,6 +2619,11 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         </div>
 
         <h3 style={{ ...styles.cardTitle, color: theme.title }}>{book.title}</h3>
+
+        <div style={styles.metaPillRow}>
+          <span style={styles.metaPill}>{confidence}</span>
+          {book.reviewed && <span style={styles.metaPill}>Reviewed</span>}
+        </div>
 
         {options.compact ? (
           <>
@@ -1353,6 +2686,27 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                 ♥
               </button>
 
+              <select
+                style={styles.inlineSelect}
+                value={folderName}
+                onChange={(event) => assignBookFolder(book, event.target.value)}
+                aria-label="Book folder"
+              >
+                {folders.map((folder) => (
+                  <option key={folder} value={folder}>
+                    {folder}
+                  </option>
+                ))}
+              </select>
+
+              <button style={styles.smallButton} onClick={() => markBookReviewed(book)}>
+                Review
+              </button>
+
+              <button style={styles.smallButton} onClick={() => editBookTitle(book)}>
+                Edit
+              </button>
+
               <button
                 style={{
                   ...styles.smallButton,
@@ -1377,6 +2731,364 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           </p>
         )}
       </div>
+    );
+  }
+
+  function renderFilterControls() {
+    return (
+      <section style={styles.filterPanel}>
+        <div style={styles.filterHeader}>
+          <h2 style={styles.filterTitle}>Filters</h2>
+          <button
+            type="button"
+            style={styles.clearFilterButton}
+            onClick={clearFilters}
+            disabled={activeFilterCount === 0}
+          >
+            Clear
+          </button>
+        </div>
+
+        <div style={styles.filterComposer}>
+          <input
+            style={styles.filterSearchInput}
+            placeholder={
+              voiceListening
+                ? "Listening for genre, age, rating, or level..."
+                : "Search or speak filters..."
+            }
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                const trimmedSearch = search.trim();
+                setVoiceStatus(
+                  trimmedSearch
+                    ? `Searched: "${trimmedSearch}"`
+                    : "Type or speak a filter search first."
+                );
+              }
+            }}
+          />
+          <button
+            type="button"
+            style={{
+              ...styles.iconComposerButton,
+              ...(voiceListening ? styles.iconComposerButtonActive : {}),
+            }}
+            onClick={handleVoiceSearch}
+            aria-label={voiceListening ? "Stop voice search" : "Start voice search"}
+            aria-pressed={voiceListening}
+          >
+            {voiceListening ? "■" : "🎙"}
+          </button>
+          <button
+            type="button"
+            style={styles.sendComposerButton}
+            onClick={() => {
+              const trimmedSearch = search.trim();
+              setVoiceStatus(
+                trimmedSearch
+                  ? `Searched: "${trimmedSearch}"`
+                  : "Type or speak a filter search first."
+              );
+            }}
+            aria-label="Search filters"
+          >
+            ↑
+          </button>
+        </div>
+
+        {voiceStatus && <p style={styles.voiceStatus}>{voiceStatus}</p>}
+
+        <div style={styles.filterGrid}>
+          <label style={styles.filterLabel}>
+            <span>Genre</span>
+            <input
+              style={styles.filterControl}
+              list="genre-options"
+              value={filters.genre}
+              placeholder="Any genre"
+              onChange={(event) => updateFilter("genre", event.target.value)}
+            />
+            <datalist id="genre-options">
+              {genreOptions.map((genre) => (
+                <option key={genre} value={genre} />
+              ))}
+            </datalist>
+          </label>
+
+          <label style={styles.filterLabel}>
+            <span>Grade</span>
+            <select
+              style={styles.filterControl}
+              value={filters.gradeBand}
+              onChange={(event) => updateFilter("gradeBand", event.target.value)}
+            >
+              <option value="">Any grade</option>
+              {FILTER_OPTIONS.gradeBand.map((gradeBand) => (
+                <option key={gradeBand} value={gradeBand}>
+                  {gradeBand}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label style={styles.filterLabel}>
+            <span>Book Level</span>
+            <select
+              style={styles.filterControl}
+              value={filters.readingLevel}
+              onChange={(event) =>
+                updateFilter("readingLevel", event.target.value)
+              }
+            >
+              <option value="">Any level</option>
+              {FILTER_OPTIONS.readingLevel.map((readingLevel) => (
+                <option key={readingLevel} value={readingLevel}>
+                  {readingLevel}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label style={styles.filterLabel}>
+            <span>Age</span>
+            <select
+              style={styles.filterControl}
+              value={filters.ageRecommendation}
+              onChange={(event) =>
+                updateFilter("ageRecommendation", event.target.value)
+              }
+            >
+              <option value="">Any age</option>
+              {FILTER_OPTIONS.ageRecommendation.map((ageRecommendation) => (
+                <option key={ageRecommendation} value={ageRecommendation}>
+                  {ageRecommendation}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label style={styles.filterLabel}>
+            <span>Shelf Pick</span>
+            <select
+              style={styles.filterControl}
+              value={filters.shelfPick}
+              onChange={(event) => updateFilter("shelfPick", event.target.value)}
+            >
+              <option value="">Any pick</option>
+              {FILTER_OPTIONS.shelfPick.map((shelfPick) => (
+                <option key={shelfPick} value={shelfPick}>
+                  {shelfPick}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label style={styles.filterLabel}>
+            <span>Rating</span>
+            <select
+              style={styles.filterControl}
+              value={filters.minRating}
+              onChange={(event) => updateFilter("minRating", event.target.value)}
+            >
+              <option value="">Any rating</option>
+              {FILTER_OPTIONS.minRating.map((rating) => (
+                <option key={rating} value={rating}>
+                  {rating}+ stars
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </section>
+    );
+  }
+
+  function renderLoginPage() {
+    const isSignUp = authMode === "signup";
+
+    if (user) {
+      return (
+        <section style={styles.authPanel}>
+          <div style={styles.authHeader}>
+            <h2 style={styles.authTitle}>Account</h2>
+            <p style={styles.authSubtitle}>
+              Signed in as {getUserDisplayName(user)}
+              {user.email ? ` (${user.email})` : ""}.
+            </p>
+          </div>
+
+          {!user.emailVerified && (
+            <p style={styles.authNotice}>
+              Your email is not verified yet. Verify it to protect the account
+              and unlock full saved-list sync.
+            </p>
+          )}
+
+          <div style={styles.authActionRow}>
+            {!user.emailVerified && (
+              <>
+                <button
+                  type="button"
+                  style={styles.authSecondaryButton}
+                  onClick={handleResendVerification}
+                  disabled={authLoading || !isFirebaseConfigured}
+                >
+                  Resend verification
+                </button>
+                <button
+                  type="button"
+                  style={styles.authTextButton}
+                  onClick={handleRefreshVerification}
+                  disabled={authLoading || !isFirebaseConfigured}
+                >
+                  I verified, refresh
+                </button>
+              </>
+            )}
+            <button type="button" style={styles.authTextButton} onClick={handleSignOut}>
+              Sign out
+            </button>
+          </div>
+
+          {authMessage && <p style={styles.authMessage}>{authMessage}</p>}
+        </section>
+      );
+    }
+
+    return (
+      <section style={styles.authPanel}>
+        <div style={styles.authHeader}>
+          <h2 style={styles.authTitle}>{isSignUp ? "Create account" : "Log in"}</h2>
+          <p style={styles.authSubtitle}>
+            Use Google single sign-on or create an email/password account to
+            keep your saved books and filters synced.
+          </p>
+        </div>
+
+        {!isFirebaseConfigured && (
+          <p style={styles.authNotice}>
+            Firebase is not configured yet. Add your Firebase web config in
+            `.env.local`, then enable Authentication and Firestore.
+          </p>
+        )}
+
+        {user && !user.emailVerified && (
+          <p style={styles.authNotice}>
+            Your email is not verified yet. Verify it to protect the account and
+            reduce spam signups.
+          </p>
+        )}
+
+        <form style={styles.authForm} onSubmit={handleAuthSubmit}>
+          {isSignUp && (
+            <label style={styles.filterLabel}>
+              <span>Name</span>
+              <input
+                style={styles.filterControl}
+                value={authForm.name}
+                placeholder="Reader name"
+                autoComplete="name"
+                maxLength={MAX_DISPLAY_NAME_LENGTH}
+                onChange={(event) => updateAuthForm("name", event.target.value)}
+              />
+            </label>
+          )}
+
+          <label style={styles.filterLabel}>
+            <span>Email</span>
+            <input
+              style={styles.filterControl}
+              value={authForm.email}
+              type="email"
+              placeholder="you@example.com"
+              autoComplete="email"
+              onChange={(event) => updateAuthForm("email", event.target.value)}
+            />
+          </label>
+
+          <label style={styles.filterLabel}>
+            <span>Password</span>
+            <input
+              style={styles.filterControl}
+              value={authForm.password}
+              type="password"
+              placeholder="Password"
+              autoComplete={isSignUp ? "new-password" : "current-password"}
+              onChange={(event) => updateAuthForm("password", event.target.value)}
+            />
+            {isSignUp && (
+              <span style={styles.passwordHint}>
+                At least 8 characters with an uppercase letter, a number, and a special character.
+              </span>
+            )}
+          </label>
+
+          <button
+            type="submit"
+            style={styles.authPrimaryButton}
+            disabled={authLoading || !isFirebaseConfigured}
+          >
+            {authLoading ? "Working..." : isSignUp ? "Create Account" : "Log In"}
+          </button>
+        </form>
+
+        <div style={styles.authActionRow}>
+          <button
+            type="button"
+            style={styles.authSecondaryButton}
+            onClick={handleGoogleLogin}
+            disabled={authLoading || !isFirebaseConfigured}
+          >
+            Continue with Google SSO
+          </button>
+          <button
+            type="button"
+            style={styles.authTextButton}
+            onClick={handleForgotPassword}
+            disabled={authLoading || !isFirebaseConfigured}
+          >
+            Forgot password
+          </button>
+          {user && !user.emailVerified && (
+            <>
+              <button
+                type="button"
+                style={styles.authTextButton}
+                onClick={handleResendVerification}
+                disabled={authLoading || !isFirebaseConfigured}
+              >
+                Resend verification
+              </button>
+              <button
+                type="button"
+                style={styles.authTextButton}
+                onClick={handleRefreshVerification}
+                disabled={authLoading || !isFirebaseConfigured}
+              >
+                I verified, refresh
+              </button>
+            </>
+          )}
+        </div>
+
+        <div style={styles.authFooter}>
+          <button
+            type="button"
+            style={styles.authTextButton}
+            onClick={() => {
+              setAuthMode(isSignUp ? "signin" : "signup");
+              setAuthMessage("");
+            }}
+          >
+            {isSignUp ? "Already have an account? Log in" : "Need an account? Sign up"}
+          </button>
+        </div>
+
+        {authMessage && <p style={styles.authMessage}>{authMessage}</p>}
+      </section>
     );
   }
 
@@ -1593,22 +3305,14 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     setPreviewModal(null);
     previewRequestId.current += 1;
     setSaveStatus(null);
+    setVoiceStatus("");
+    setVoiceListening(false);
+    recognitionRef.current?.abort();
   }
 
   const recentRequestEvents = getRecentEvents(geminiUsage?.requestEvents);
-  const todayKey = getTodayKey();
-  const geminiRequestBaseline =
-    todayKey === TODAY_SCAN_REQUEST_USAGE_BASELINE.date
-      ? TODAY_SCAN_REQUEST_USAGE_BASELINE.count
-      : 0;
-  const geminiUsageCount =
-    geminiRequestBaseline + Number(geminiUsage?.count || 0);
-  const geminiTokenBaseline =
-    todayKey === TODAY_SCAN_TOKEN_USAGE_BASELINE.date
-      ? TODAY_SCAN_TOKEN_USAGE_BASELINE.count
-      : 0;
-  const geminiDailyPromptTokens =
-    geminiTokenBaseline + Number(geminiUsage?.promptTokens || 0);
+  const geminiUsageCount = Number(geminiUsage?.count || 0);
+  const geminiDailyTotalTokens = Number(geminiUsage?.promptTokens || 0);
   const geminiDailyTokenLimit = GEMINI_SCAN_DAILY_TOKEN_LIMIT;
   const geminiMinuteRequests = recentRequestEvents.length;
   const geminiUsagePercent = Math.min(
@@ -1621,7 +3325,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
   );
   const geminiTpmPercent = Math.min(
     100,
-    Math.round((geminiDailyPromptTokens / geminiDailyTokenLimit) * 100)
+    Math.round((geminiDailyTotalTokens / geminiDailyTokenLimit) * 100)
   );
   const geminiRemaining = Math.max(0, GEMINI_DAILY_LIMIT - geminiUsageCount);
   const geminiRpmRemaining = Math.max(
@@ -1630,7 +3334,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
   );
   const geminiTpmRemaining = Math.max(
     0,
-    geminiDailyTokenLimit - geminiDailyPromptTokens
+    geminiDailyTokenLimit - geminiDailyTotalTokens
   );
   const geminiLiveStatus =
     activeGeminiCalls > 0 ? "Running" : geminiUsage?.lastStatus || "Idle";
@@ -1640,10 +3344,328 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     geminiUsagePercent >= 90 || geminiRpmPercent >= 90 || geminiTpmPercent >= 90
       ? "Close to a configured scan limit. Pause before making more scans."
       : "Within the configured scan limits.";
+  const signedInName = user ? getUserDisplayName(user) : "";
+  const canOpenDeveloper = hasDeveloperAccess(user);
+  const homeGreeting = user
+    ? `Hi ${signedInName}, ${getTimeGreeting()}.`
+    : "Welcome to Lumina.";
+  const homeGreetingDetail = user
+    ? "Your saved books, filters, and preview files are ready here."
+    : "Sign in to sync your saved books and filters across devices.";
+
+  const renderGeminiQuotaPanel = () => (
+    <div style={{ ...styles.devUsageMeter, margin: "0 0 16px" }}>
+      <button
+        type="button"
+        style={styles.devUsageToggle}
+        onClick={() => setDevQuotaOpen((isOpen) => !isOpen)}
+        aria-expanded={devQuotaOpen}
+      >
+        <span>Gemini scan quota</span>
+        <span>
+          {geminiUsageCount.toLocaleString()} requests · {geminiDailyTotalTokens.toLocaleString()}/
+          {geminiDailyTokenLimit.toLocaleString()} tokens {devQuotaOpen ? "▲" : "▼"}
+        </span>
+      </button>
+
+      {devQuotaOpen && (
+        <>
+          {[
+            {
+              label: "RPD",
+              value: `${geminiUsageCount}/${GEMINI_DAILY_LIMIT}`,
+              percent: geminiUsagePercent,
+            },
+            {
+              label: "RPM",
+              value: `${geminiMinuteRequests}/${GEMINI_SCAN_RPM_LIMIT}`,
+              percent: geminiRpmPercent,
+            },
+            {
+              label: "Tokens/day",
+              value: `${geminiDailyTotalTokens.toLocaleString()}/${geminiDailyTokenLimit.toLocaleString()}`,
+              percent: geminiTpmPercent,
+            },
+          ].map((meter) => (
+            <div key={meter.label} style={styles.devQuotaRow}>
+              <div style={styles.devQuotaLabelRow}>
+                <span>{meter.label}</span>
+                <span>{meter.value}</span>
+              </div>
+              <div style={styles.devUsageTrack} aria-hidden="true">
+                <span
+                  style={{
+                    ...styles.devUsageFill,
+                    width: `${meter.percent}%`,
+                    ...(meter.percent >= 90 ? styles.devUsageFillWarning : {}),
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+          <p style={styles.devUsageText}>
+            {geminiWarning} Left: {geminiRemaining} day, {geminiRpmRemaining}
+            /min, {`${geminiTpmRemaining.toLocaleString()} tokens today`}.
+          </p>
+          <div style={styles.devLiveStatusRow}>
+            <span
+              style={{
+                ...styles.devStatusDot,
+                ...(geminiLiveStatus === "Running"
+                  ? styles.devStatusDotRunning
+                  : {}),
+                ...(geminiLiveStatus === "Failed"
+                  ? styles.devStatusDotFailed
+                  : {}),
+              }}
+            />
+            <span>
+              Live status: {geminiLiveStatus} · Last: {geminiLastType}
+              {geminiLastUpdated ? ` at ${geminiLastUpdated}` : ""}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+
+  function renderLibraryPage() {
+    const folderTabs = ["All", ...folders];
+    const libraryBooks = readingList.filter((book) => {
+      if (activeFolder === "All") return true;
+      return (bookFolders[getBookKey(book)] || "Want to read") === activeFolder;
+    });
+
+    return (
+      <section style={styles.developerPanel}>
+        <div style={styles.authHeader}>
+          <h2 style={styles.authTitle}>Library</h2>
+          <p style={styles.authSubtitle}>Saved books, folders, previews, and details in one place.</p>
+        </div>
+        <div style={styles.pageNav}>
+          {folderTabs.map((folder) => (
+            <button
+              key={folder}
+              type="button"
+              style={{
+                ...styles.navButton,
+                ...(activeFolder === folder ? styles.navButtonActive : {}),
+              }}
+              onClick={() => setActiveFolder(folder)}
+            >
+              {folder}
+            </button>
+          ))}
+        </div>
+        {libraryBooks.length === 0 ? (
+          <p style={styles.countText}>No saved books in this folder yet.</p>
+        ) : (
+          <div style={styles.grid}>
+            {libraryBooks.map((book, index) => renderBookCard(book, index, { prefix: "library" }))}
+          </div>
+        )}
+        {renderSavedFiles("library")}
+      </section>
+    );
+  }
+
+  function renderHistoryPage() {
+    return (
+      <section style={styles.developerPanel}>
+        <div style={styles.authHeader}>
+          <h2 style={styles.authTitle}>Scan History</h2>
+          <p style={styles.authSubtitle}>Review previous bookshelf scans and reopen detected books.</p>
+        </div>
+        {scanHistory.length === 0 ? (
+          <p style={styles.countText}>No scans yet. Scan a shelf to build history.</p>
+        ) : (
+          <div style={styles.savedFileList}>
+            {scanHistory.map((scan) => (
+              <div key={scan.id} style={styles.savedFileItem}>
+                <div style={styles.savedFileInfo}>
+                  <strong>{scan.imageName || "Bookshelf scan"}</strong>
+                  <p style={styles.savedFileMeta}>
+                    {getDisplayTime(scan.createdAt)} · {scan.bookCount} books · {scan.provider || "gemini"} · {Number(scan.totalTokens || 0).toLocaleString()} tokens
+                  </p>
+                </div>
+                <div style={styles.savedFileActions}>
+                  <button
+                    type="button"
+                    style={styles.smallButton}
+                    onClick={() => {
+                      setBooks(Array.isArray(scan.books) ? scan.books : []);
+                      setCurrentPage("scan");
+                    }}
+                  >
+                    Reopen
+                  </button>
+                  <button
+                    type="button"
+                    style={styles.deleteButton}
+                    onClick={() => setScanHistory((history) => history.filter((item) => item.id !== scan.id))}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    );
+  }
+
+  function renderLaunchReadiness() {
+    return (
+      <section style={styles.developerPanel}>
+        <div style={styles.authHeader}>
+          <h2 style={styles.authTitle}>Launch Readiness</h2>
+          <p style={styles.authSubtitle}>Google Play basics to finish before public release.</p>
+        </div>
+        <div style={styles.developerStatsGrid}>
+          {LAUNCH_READINESS_ITEMS.map((item) => (
+            <div key={item} style={styles.developerStatCard}>
+              <span style={styles.developerStatLabel}>Checklist</span>
+              <strong style={styles.developerStatValueSmall}>{item}</strong>
+            </div>
+          ))}
+        </div>
+      </section>
+    );
+  }
+
+  function renderAccountPage() {
+    return (
+      <>
+        {renderLoginPage()}
+        {user && renderLaunchReadiness()}
+        {canOpenDeveloper && renderDeveloperPage()}
+      </>
+    );
+  }
+
+  const renderDeveloperPage = () => (
+    <section style={styles.developerPanel}>
+      <div style={styles.authHeader}>
+        <h2 style={styles.authTitle}>Developer</h2>
+        <p style={styles.authSubtitle}>
+          Temporary developer page for Firebase auth stats and Gemini usage.
+        </p>
+      </div>
+
+      <div style={styles.developerLinkRow}>
+        <a
+          style={styles.developerLinkButton}
+          href={firestoreConsoleUrl}
+          target="_blank"
+          rel="noreferrer"
+        >
+          Open Firebase DB
+        </a>
+      </div>
+
+      <div style={styles.developerStatsGrid}>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>API calls today</span>
+          <strong style={styles.developerStatValue}>
+            {developerUsage.apiCalls.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Prompt tokens today</span>
+          <strong style={styles.developerStatValue}>
+            {developerUsage.promptTokens.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Output tokens today</span>
+          <strong style={styles.developerStatValue}>
+            {developerUsage.outputTokens.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Total tokens today</span>
+          <strong style={styles.developerStatValue}>
+            {developerUsage.totalTokens.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Success / failed</span>
+          <strong style={styles.developerStatValueSmall}>
+            {developerUsage.successCalls.toLocaleString()} / {developerUsage.failedCalls.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Last API call</span>
+          <strong style={styles.developerStatValueSmall}>
+            {developerUsage.lastCallType || "No API calls yet"}
+            {developerUsage.lastStatus ? ` · ${developerUsage.lastStatus}` : ""}
+            {developerUsage.lastProvider ? ` · ${developerUsage.lastProvider}` : ""}
+            {developerUsage.lastModel ? ` · ${developerUsage.lastModel}` : ""}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Last customer</span>
+          <strong style={styles.developerStatValueSmall}>
+            {developerUsage.lastUserEmail || "No API calls yet"}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Registered users</span>
+          <strong style={styles.developerStatValue}>
+            {developerStats.registeredUsers.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Total logins</span>
+          <strong style={styles.developerStatValue}>
+            {developerStats.totalLoginEvents.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Logins today</span>
+          <strong style={styles.developerStatValue}>
+            {developerStats.todayLoginEvents.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Recent unique users</span>
+          <strong style={styles.developerStatValue}>
+            {developerStats.recentUniqueUsers.toLocaleString()}
+          </strong>
+        </div>
+        <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Last login</span>
+          <strong style={styles.developerStatValueSmall}>
+            {developerStats.lastLoginEmail || "No logins yet"}
+            {developerStats.lastLoginMethod ? ` · ${developerStats.lastLoginMethod}` : ""}
+            {developerStats.lastLoginAt ? ` · ${getDisplayTime(developerStats.lastLoginAt)}` : ""}
+          </strong>
+        </div>
+      </div>
+      {developerStatsStatus && (
+        <p style={styles.authNotice}>{developerStatsStatus}</p>
+      )}
+
+      {renderGeminiQuotaPanel()}
+    </section>
+  );
 
   return (
     <div style={styles.page}>
       <div className="idle-background" aria-hidden="true">
+        <span className="gravity-line gravity-line-one" />
+        <span className="gravity-line gravity-line-two" />
+        <span className="gravity-line gravity-line-three" />
+        <span className="gravity-line gravity-line-four" />
+        <span className="gravity-dot gravity-dot-blue gravity-dot-one" />
+        <span className="gravity-dot gravity-dot-green gravity-dot-two" />
+        <span className="gravity-dot gravity-dot-yellow gravity-dot-three" />
+        <span className="gravity-dot gravity-dot-red gravity-dot-four" />
+        <span className="gravity-dot gravity-dot-blue gravity-dot-five" />
+        <span className="gravity-dot gravity-dot-green gravity-dot-six" />
+        <span className="gravity-dot gravity-dot-yellow gravity-dot-seven" />
+        <span className="gravity-dot gravity-dot-red gravity-dot-eight" />
         <span className="idle-scan idle-scan-one" />
         <span className="idle-scan idle-scan-two" />
         <span
@@ -1706,6 +3728,43 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         </div>
       </div>
 
+      <nav style={styles.pageNav} aria-label="App pages">
+        {[
+          ["scan", "Scan"],
+          ["library", "Library"],
+          ["history", "History"],
+          ["account", "Account"],
+        ].map(([pageId, label]) => (
+          <button
+            key={pageId}
+            type="button"
+            style={{
+              ...styles.navButton,
+              ...(currentPage === pageId ? styles.navButtonActive : {}),
+            }}
+            onClick={() => setCurrentPage(pageId)}
+          >
+            {label}
+          </button>
+        ))}
+        {user && (
+          <button type="button" style={styles.navButton} onClick={handleSignOut}>
+            Sign Out
+          </button>
+        )}
+      </nav>
+
+      {currentPage === "account" && renderAccountPage()}
+      {currentPage === "library" && renderLibraryPage()}
+      {currentPage === "history" && renderHistoryPage()}
+
+      {currentPage === "scan" && (
+        <>
+      <section style={styles.homeGreetingPanel}>
+        <h2 style={styles.homeGreetingTitle}>{homeGreeting}</h2>
+        <p style={styles.homeGreetingText}>{homeGreetingDetail}</p>
+      </section>
+
       <div style={styles.uploadBox}>
         <label style={styles.cameraButton}>
           📷 Take Photo
@@ -1729,81 +3788,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         </label>
       </div>
 
-      <div style={styles.devUsageMeter}>
-        <button
-          type="button"
-          style={styles.devUsageToggle}
-          onClick={() => setDevQuotaOpen((isOpen) => !isOpen)}
-          aria-expanded={devQuotaOpen}
-        >
-          <span>Gemini scan quota</span>
-          <span>
-            {geminiDailyPromptTokens.toLocaleString()}/
-            {geminiDailyTokenLimit.toLocaleString()} tokens {devQuotaOpen ? "▲" : "▼"}
-          </span>
-        </button>
-
-        {devQuotaOpen && (
-          <>
-            {[
-              {
-                label: "RPD",
-                value: `${geminiUsageCount}/${GEMINI_DAILY_LIMIT}`,
-                percent: geminiUsagePercent,
-              },
-              {
-                label: "RPM",
-                value: `${geminiMinuteRequests}/${GEMINI_SCAN_RPM_LIMIT}`,
-                percent: geminiRpmPercent,
-              },
-              {
-                label: "Tokens/day",
-                value: `${geminiDailyPromptTokens.toLocaleString()}/${geminiDailyTokenLimit.toLocaleString()}`,
-                percent: geminiTpmPercent,
-              },
-            ].map((meter) => (
-              <div key={meter.label} style={styles.devQuotaRow}>
-                <div style={styles.devQuotaLabelRow}>
-                  <span>{meter.label}</span>
-                  <span>{meter.value}</span>
-                </div>
-                <div style={styles.devUsageTrack} aria-hidden="true">
-                  <span
-                    style={{
-                      ...styles.devUsageFill,
-                      width: `${meter.percent}%`,
-                      ...(meter.percent >= 90
-                        ? styles.devUsageFillWarning
-                        : {}),
-                    }}
-                  />
-                </div>
-              </div>
-            ))}
-            <p style={styles.devUsageText}>
-              {geminiWarning} Left: {geminiRemaining} day, {geminiRpmRemaining}
-              /min, {`${geminiTpmRemaining.toLocaleString()} tokens today`}.
-            </p>
-            <div style={styles.devLiveStatusRow}>
-              <span
-                style={{
-                  ...styles.devStatusDot,
-                  ...(geminiLiveStatus === "Running"
-                    ? styles.devStatusDotRunning
-                    : {}),
-                  ...(geminiLiveStatus === "Failed"
-                    ? styles.devStatusDotFailed
-                    : {}),
-                }}
-              />
-              <span>
-                Live status: {geminiLiveStatus} · Last: {geminiLastType}
-                {geminiLastUpdated ? ` at ${geminiLastUpdated}` : ""}
-              </span>
-            </div>
-          </>
-        )}
-      </div>
+      {renderFilterControls()}
 
       {imagePreview && (
         <img src={imagePreview} alt="Bookshelf" style={styles.preview} />
@@ -1817,13 +3802,6 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
       {books.length > 0 && (
         <>
           <div style={styles.searchRow}>
-            <input
-              style={styles.search}
-              placeholder="🔍 Filter books..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-
             <input
               style={styles.askInput}
               placeholder="🤖 Ask for recommendations..."
@@ -1878,8 +3856,10 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           {renderSavedFiles("results")}
         </>
       )}
+        </>
+      )}
 
-      {compare.length > 0 && (
+      {currentPage === "scan" && compare.length > 0 && (
         <section style={styles.compareTray}>
           <div>
             <h2 style={{ ...styles.sectionTitle, marginTop: 0 }}>⚖️ Compare Books</h2>
@@ -1905,7 +3885,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         </section>
       )}
 
-      {selectedBook &&
+      {currentPage === "scan" && selectedBook &&
         (() => {
           const theme = getTheme(selectedBook);
           const detailSaveStatus = getScopedSaveStatus(
@@ -1989,6 +3969,16 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                     <b>🏫 Grade</b>
                     <p>{selectedBook.gradeBand || "Not listed"}</p>
                   </div>
+
+                  <div style={styles.detailMiniCard}>
+                    <b>✅ Confidence</b>
+                    <p>{selectedBook.scanConfidence || getScanConfidence(selectedBook).label}</p>
+                  </div>
+
+                  <div style={styles.detailMiniCard}>
+                    <b>📁 Folder</b>
+                    <p>{bookFolders[getBookKey(selectedBook)] || "Want to read"}</p>
+                  </div>
                 </div>
 
                 <div style={styles.detailBox}>
@@ -2002,6 +3992,18 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                     <b>📖 Summary:</b>
                     <br />
                     {selectedBook.summary}
+                  </p>
+
+                  <p>
+                    <b>🧭 Similar reads:</b>
+                    <br />
+                    Look for more {selectedBook.genre || "books"} with a {selectedBook.readingLevel || "similar"} reading level.
+                  </p>
+
+                  <p>
+                    <b>🛡️ Suitability note:</b>
+                    <br />
+                    {getContentGuidance(selectedBook)}
                   </p>
                 </div>
 
@@ -2020,6 +4022,14 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                     {detailsSaved ? "Saved Details" : "Save Details"}
                   </button>
 
+                  <button style={styles.secondaryButton} onClick={() => markBookReviewed(selectedBook)}>
+                    Mark reviewed
+                  </button>
+
+                  <button style={styles.secondaryButton} onClick={() => editBookTitle(selectedBook)}>
+                    Edit title
+                  </button>
+
                   <button
                     style={{ ...styles.closeButton, marginTop: 0 }}
                     onClick={() => setSelectedBook(null)}
@@ -2032,7 +4042,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           );
         })()}
 
-      {compareOpen && compare.length > 0 && (
+      {currentPage === "scan" && compareOpen && compare.length > 0 && (
         <div style={styles.modal}>
           <div style={styles.compareModalContent}>
             <div style={styles.previewHeader}>
@@ -2096,7 +4106,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         </div>
       )}
 
-      {previewModal && (
+      {currentPage === "scan" && previewModal && (
         <div style={styles.modal}>
           <div style={styles.previewModalContent}>
             <div style={styles.previewHeader}>
@@ -2199,13 +4209,15 @@ const styles = {
     maxWidth: "1000px",
     margin: "auto",
     padding: "clamp(14px, 4vw, 24px)",
-    fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-    background: "linear-gradient(180deg, rgba(32, 33, 36, 0.98), rgba(23, 23, 23, 0.98))",
-    color: "#bdc1c6",
+    fontFamily:
+      '"Google Sans Flex", "Google Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    background:
+      "linear-gradient(180deg, rgba(18, 19, 23, 0.9), rgba(24, 25, 29, 0.96))",
+    color: "#cdd4dc",
   },
   hero: {
     background:
-      "linear-gradient(135deg, rgba(26, 115, 232, 0.16), rgba(32, 33, 36, 0.96) 46%, rgba(15, 15, 16, 0.96)), linear-gradient(90deg, rgba(66, 133, 244, 0.2), rgba(52, 168, 83, 0.14), rgba(251, 188, 5, 0.12), rgba(234, 67, 53, 0.13))",
+      "linear-gradient(135deg, rgba(50, 121, 249, 0.18), rgba(33, 34, 38, 0.92) 45%, rgba(18, 19, 23, 0.96)), linear-gradient(90deg, rgba(50, 121, 249, 0.22), rgba(52, 168, 83, 0.16), rgba(251, 188, 5, 0.12), rgba(234, 67, 53, 0.14))",
     borderRadius: "8px",
     padding: "clamp(22px, 6vw, 32px) clamp(16px, 5vw, 24px)",
     display: "flex",
@@ -2213,9 +4225,10 @@ const styles = {
     gap: "16px",
     alignItems: "center",
     flexWrap: "wrap",
-    boxShadow: "0 18px 50px rgba(0, 0, 0, 0.28)",
+    boxShadow: "0 24px 80px rgba(0, 0, 0, 0.36)",
     color: "#ffffff",
-    border: "1px solid rgba(255, 255, 255, 0.08)",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
+    backdropFilter: "blur(18px)",
   },
   heroText: {
     flex: "1 1 260px",
@@ -2239,8 +4252,10 @@ const styles = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    background: "linear-gradient(145deg, rgba(26, 115, 232, 0.34), rgba(32, 33, 36, 0.88))",
-    boxShadow: "0 0 0 1px rgba(255, 255, 255, 0.2), 0 12px 32px rgba(66, 133, 244, 0.28)",
+    background:
+      "linear-gradient(145deg, rgba(50, 121, 249, 0.34), rgba(33, 34, 38, 0.88))",
+    boxShadow:
+      "0 0 0 1px rgba(230, 234, 240, 0.18), 0 12px 32px rgba(50, 121, 249, 0.28)",
     overflow: "hidden",
     flex: "0 0 auto",
   },
@@ -2294,7 +4309,7 @@ const styles = {
     letterSpacing: 0,
   },
   subtitle: {
-    color: "#bdc1c6",
+    color: "#cdd4dc",
     fontSize: "16px",
     lineHeight: 1.5,
     marginTop: "12px",
@@ -2307,9 +4322,9 @@ const styles = {
     minHeight: "40px",
     padding: "10px 14px",
     borderRadius: "999px",
-    border: "1px solid rgba(138, 180, 248, 0.32)",
-    background: "rgba(18, 18, 20, 0.54)",
-    color: "#d8e2f3",
+    border: "1px solid rgba(230, 234, 240, 0.14)",
+    background: "rgba(18, 19, 23, 0.62)",
+    color: "#e6eaf0",
     fontSize: "14px",
     fontWeight: "650",
     flex: "0 0 auto",
@@ -2318,8 +4333,29 @@ const styles = {
     width: "10px",
     height: "10px",
     borderRadius: "999px",
-    background: "#34a853",
-    boxShadow: "0 0 0 4px rgba(52, 168, 83, 0.14)",
+    background: "#3279f9",
+    boxShadow: "0 0 0 4px rgba(50, 121, 249, 0.14)",
+  },
+  homeGreetingPanel: {
+    margin: "18px 0 0",
+    padding: "14px 16px",
+    borderRadius: "8px",
+    background: "rgba(52, 168, 83, 0.1)",
+    border: "1px solid rgba(52, 168, 83, 0.24)",
+    textAlign: "left",
+  },
+  homeGreetingTitle: {
+    margin: 0,
+    color: "#e6f4ea",
+    fontSize: "20px",
+    lineHeight: 1.25,
+    fontWeight: "750",
+  },
+  homeGreetingText: {
+    margin: "6px 0 0",
+    color: "#cdd4dc",
+    fontSize: "14px",
+    lineHeight: 1.45,
   },
   uploadBox: {
     display: "flex",
@@ -2327,30 +4363,301 @@ const styles = {
     flexWrap: "wrap",
     margin: "24px 0",
   },
+  pageNav: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flexWrap: "wrap",
+    margin: "16px 0 6px",
+  },
+  navButton: {
+    minHeight: "36px",
+    padding: "8px 12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
+    background: "rgba(33, 34, 38, 0.72)",
+    color: "#e6eaf0",
+    cursor: "pointer",
+    fontWeight: "700",
+    fontSize: "13px",
+  },
+  navButtonActive: {
+    background: "rgba(50, 121, 249, 0.18)",
+    border: "1px solid rgba(50, 121, 249, 0.42)",
+    color: "#d8e7ff",
+  },
   cameraButton: {
     flex: "1 1 150px",
     textAlign: "center",
-    background: "#1a73e8",
+    background: "#3279f9",
     color: "#ffffff",
     padding: "12px 20px",
     borderRadius: "8px",
-    border: "1px solid #1a73e8",
+    border: "1px solid #3279f9",
     cursor: "pointer",
     fontWeight: "650",
     transition: "background 0.2s",
-    boxShadow: "0 10px 24px rgba(26, 115, 232, 0.24)",
+    boxShadow: "0 12px 30px rgba(50, 121, 249, 0.28)",
   },
   galleryButton: {
     flex: "1 1 180px",
     textAlign: "center",
-    background: "#202124",
-    color: "#e8eaed",
+    background: "rgba(33, 34, 38, 0.86)",
+    color: "#e6eaf0",
     padding: "12px 20px",
     borderRadius: "8px",
-    border: "1px solid #3c4043",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
     cursor: "pointer",
     fontWeight: "650",
     transition: "background 0.2s",
+  },
+  voiceButton: {
+    flex: "1 1 160px",
+    textAlign: "center",
+    background: "rgba(251, 188, 5, 0.12)",
+    color: "#fff4c2",
+    padding: "12px 20px",
+    borderRadius: "8px",
+    border: "1px solid rgba(251, 188, 5, 0.34)",
+    cursor: "pointer",
+    fontWeight: "650",
+    transition: "background 0.2s, box-shadow 0.2s",
+    boxShadow: "0 12px 30px rgba(251, 188, 5, 0.12)",
+  },
+  voiceButtonActive: {
+    background: "rgba(234, 67, 53, 0.2)",
+    color: "#fce8e6",
+    border: "1px solid rgba(234, 67, 53, 0.48)",
+    boxShadow: "0 0 0 4px rgba(234, 67, 53, 0.14)",
+  },
+  voiceStatus: {
+    margin: "10px 0 14px",
+    padding: "10px 12px",
+    borderRadius: "8px",
+    background: "rgba(33, 34, 38, 0.72)",
+    border: "1px solid rgba(230, 234, 240, 0.1)",
+    color: "#e6eaf0",
+    fontSize: "13px",
+    fontWeight: "650",
+    textAlign: "left",
+  },
+  filterPanel: {
+    margin: "0 0 24px",
+    padding: "14px",
+    borderRadius: "8px",
+    background: "rgba(33, 34, 38, 0.78)",
+    border: "1px solid rgba(230, 234, 240, 0.1)",
+    boxShadow: "0 14px 34px rgba(0, 0, 0, 0.16)",
+    textAlign: "left",
+  },
+  filterHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "12px",
+    marginBottom: "12px",
+  },
+  filterTitle: {
+    margin: 0,
+    color: "#f8f9fc",
+    fontSize: "18px",
+    lineHeight: 1.2,
+    fontWeight: "650",
+  },
+  filterGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))",
+    gap: "10px",
+  },
+  filterLabel: {
+    display: "grid",
+    gap: "6px",
+    color: "#cdd4dc",
+    fontSize: "12px",
+    fontWeight: "750",
+  },
+  passwordHint: {
+    color: "#9aa0a6",
+    fontSize: "12px",
+    fontWeight: "650",
+    lineHeight: 1.4,
+  },
+  filterControl: {
+    width: "100%",
+    minWidth: 0,
+    minHeight: "40px",
+    padding: "9px 10px",
+    borderRadius: "8px",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
+    background: "#18191d",
+    color: "#e6eaf0",
+    outlineColor: "#3279f9",
+    fontSize: "14px",
+    fontWeight: "600",
+    boxSizing: "border-box",
+  },
+  clearFilterButton: {
+    minHeight: "34px",
+    padding: "7px 10px",
+    borderRadius: "6px",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
+    background: "rgba(230, 234, 240, 0.06)",
+    color: "#e6eaf0",
+    cursor: "pointer",
+    fontWeight: "700",
+    fontSize: "13px",
+  },
+  authPanel: {
+    margin: "24px 0",
+    padding: "18px",
+    borderRadius: "8px",
+    background: "rgba(33, 34, 38, 0.84)",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
+    boxShadow: "0 18px 42px rgba(0, 0, 0, 0.18)",
+    textAlign: "left",
+  },
+  authHeader: {
+    marginBottom: "16px",
+  },
+  authTitle: {
+    margin: "0 0 6px",
+    color: "#f8f9fc",
+    fontSize: "24px",
+    lineHeight: 1.2,
+    fontWeight: "700",
+  },
+  authSubtitle: {
+    color: "#cdd4dc",
+    fontSize: "14px",
+    lineHeight: 1.5,
+  },
+  authNotice: {
+    margin: "0 0 14px",
+    padding: "10px 12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(251, 188, 5, 0.34)",
+    background: "rgba(251, 188, 5, 0.1)",
+    color: "#fdd663",
+    fontSize: "13px",
+    fontWeight: "650",
+  },
+  authForm: {
+    display: "grid",
+    gap: "12px",
+  },
+  authPrimaryButton: {
+    minHeight: "42px",
+    padding: "10px 14px",
+    borderRadius: "8px",
+    border: "1px solid #3279f9",
+    background: "#3279f9",
+    color: "#ffffff",
+    cursor: "pointer",
+    fontWeight: "750",
+  },
+  authSecondaryButton: {
+    minHeight: "40px",
+    padding: "9px 12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(230, 234, 240, 0.14)",
+    background: "rgba(230, 234, 240, 0.06)",
+    color: "#e6eaf0",
+    cursor: "pointer",
+    fontWeight: "700",
+  },
+  authTextButton: {
+    padding: "6px 0",
+    border: "none",
+    background: "transparent",
+    color: "#8ab4f8",
+    cursor: "pointer",
+    fontWeight: "700",
+    textAlign: "left",
+  },
+  authActionRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    flexWrap: "wrap",
+    marginTop: "12px",
+  },
+  authFooter: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "12px",
+    flexWrap: "wrap",
+    marginTop: "12px",
+  },
+  authMessage: {
+    margin: "12px 0 0",
+    padding: "10px 12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(52, 168, 83, 0.34)",
+    background: "rgba(52, 168, 83, 0.12)",
+    color: "#ceead6",
+    fontSize: "13px",
+    fontWeight: "650",
+  },
+  developerPanel: {
+    margin: "24px 0",
+    padding: "18px",
+    borderRadius: "8px",
+    background: "rgba(33, 34, 38, 0.84)",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
+    boxShadow: "0 18px 42px rgba(0, 0, 0, 0.18)",
+    textAlign: "left",
+  },
+  developerLinkRow: {
+    display: "flex",
+    justifyContent: "flex-start",
+    margin: "0 0 14px",
+  },
+  developerLinkButton: {
+    display: "inline-flex",
+    alignItems: "center",
+    minHeight: "38px",
+    padding: "8px 12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(50, 121, 249, 0.42)",
+    background: "rgba(50, 121, 249, 0.18)",
+    color: "#d8e7ff",
+    textDecoration: "none",
+    cursor: "pointer",
+    fontWeight: "750",
+    fontSize: "13px",
+  },
+  developerStatsGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+    gap: "10px",
+    marginBottom: "14px",
+  },
+  developerStatCard: {
+    padding: "12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(230, 234, 240, 0.1)",
+    background: "#18191d",
+  },
+  developerStatLabel: {
+    display: "block",
+    color: "#9aa0a6",
+    fontSize: "12px",
+    fontWeight: "750",
+    marginBottom: "6px",
+  },
+  developerStatValue: {
+    display: "block",
+    color: "#f8f9fc",
+    fontSize: "28px",
+    lineHeight: 1.1,
+  },
+  developerStatValueSmall: {
+    display: "block",
+    color: "#f8f9fc",
+    fontSize: "14px",
+    lineHeight: 1.3,
+    overflowWrap: "anywhere",
   },
   devUsageMeter: {
     margin: "-12px 0 16px",
@@ -2478,6 +4785,58 @@ const styles = {
     background: "#202124",
     color: "#e8eaed",
     outlineColor: "#1a73e8",
+  },
+  filterComposer: {
+    width: "100%",
+    minWidth: "min(100%, 280px)",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "6px",
+    borderRadius: "8px",
+    border: "1px solid rgba(230, 234, 240, 0.12)",
+    background: "#202124",
+  },
+  filterSearchInput: {
+    flex: 1,
+    minWidth: 0,
+    padding: "8px 10px",
+    border: "none",
+    fontSize: "16px",
+    background: "transparent",
+    color: "#e8eaed",
+    outline: "none",
+  },
+  iconComposerButton: {
+    width: "36px",
+    height: "36px",
+    flex: "0 0 36px",
+    borderRadius: "8px",
+    border: "1px solid rgba(251, 188, 5, 0.34)",
+    background: "rgba(251, 188, 5, 0.12)",
+    color: "#fff4c2",
+    cursor: "pointer",
+    fontSize: "16px",
+    fontWeight: "750",
+  },
+  iconComposerButtonActive: {
+    background: "rgba(234, 67, 53, 0.2)",
+    color: "#fce8e6",
+    border: "1px solid rgba(234, 67, 53, 0.48)",
+    boxShadow: "0 0 0 4px rgba(234, 67, 53, 0.14)",
+  },
+  sendComposerButton: {
+    width: "36px",
+    height: "36px",
+    flex: "0 0 36px",
+    borderRadius: "8px",
+    border: "1px solid #3279f9",
+    background: "#3279f9",
+    color: "#ffffff",
+    cursor: "pointer",
+    fontSize: "20px",
+    lineHeight: 1,
+    fontWeight: "800",
   },
   askInput: {
     flex: 1,
@@ -2765,6 +5124,34 @@ const styles = {
     fontSize: "12px",
     alignSelf: "flex-start",
     marginTop: "12px",
+  },
+  metaPillRow: {
+    display: "flex",
+    gap: "6px",
+    flexWrap: "wrap",
+    justifyContent: "center",
+    margin: "0 0 10px",
+  },
+  metaPill: {
+    display: "inline-flex",
+    alignItems: "center",
+    minHeight: "24px",
+    padding: "4px 8px",
+    borderRadius: "999px",
+    background: "rgba(50, 121, 249, 0.14)",
+    border: "1px solid rgba(50, 121, 249, 0.3)",
+    color: "#d8e7ff",
+    fontSize: "12px",
+    fontWeight: "750",
+  },
+  inlineSelect: {
+    minHeight: "36px",
+    padding: "7px 8px",
+    borderRadius: "8px",
+    border: "1px solid rgba(230, 234, 240, 0.14)",
+    background: "#18191d",
+    color: "#e6eaf0",
+    fontWeight: "700",
   },
   buttonRow: {
     display: "grid",
