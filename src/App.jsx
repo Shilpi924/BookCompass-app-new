@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState, useEffect, useRef } from "react";
-import { Capacitor } from "@capacitor/core";
+import { Capacitor, registerPlugin } from "@capacitor/core";
 import { FirebaseAuthentication } from "@capacitor-firebase/authentication";
 import {
   createUserWithEmailAndPassword,
@@ -49,6 +49,7 @@ const firestoreConsoleUrl = `https://console.firebase.google.com/project/${fireb
 const firebaseAuthConsoleUrl = `https://console.firebase.google.com/project/${firebaseProjectId}/authentication/users`;
 const isNativeApp = Capacitor.isNativePlatform();
 const isAndroidApp = Capacitor.getPlatform() === "android";
+const NativeSpeech = registerPlugin("NativeSpeech");
 const hasNativeFirebaseAuthentication = Capacitor.isPluginAvailable("FirebaseAuthentication");
 const isAndroidGoogleSsoConfigured =
   import.meta.env.VITE_ANDROID_GOOGLE_SSO_READY === "true";
@@ -95,7 +96,8 @@ const BLOCKED_NAME_TERMS = [
 const DAILY_GUEST_SCAN_LIMIT = 12;
 const DAILY_USER_SCAN_LIMIT = 30;
 const DEVELOPER_EMAILS = ["shilpispin@gmail.com"];
-const DEFAULT_FOLDERS = ["Want to read", "Read aloud", "For kids", "School", "Gift ideas", "Favorites"];
+const DEFAULT_FOLDERS = ["Want to read", "For kids", "Gift ideas", "Favorites"];
+const HIDDEN_FOLDER_NAMES = new Set(["read aloud", "school"]);
 const NEW_FOLDER_OPTION = "__new_folder__";
 const MAX_LIBRARY_CARDS = 10;
 const MAX_LIBRARY_CARD_NAME_LENGTH = 36;
@@ -423,7 +425,15 @@ function getFriendlyScanError(error) {
   const message = String(error?.message || details || "");
   const lowerMessage = message.toLowerCase();
 
-  if (lowerMessage.includes("failed to fetch") || code.includes("unavailable")) {
+  if (
+    lowerMessage.includes("high demand") ||
+    lowerMessage.includes("try again later") ||
+    lowerMessage.includes("temporarily unavailable") ||
+    code.includes("unavailable")
+  ) {
+    return "The scan AI is temporarily busy. Try again in a minute.";
+  }
+  if (lowerMessage.includes("failed to fetch")) {
     return "Lumina could not reach the scan service. Check your connection and try again.";
   }
   if (lowerMessage.includes("api key") || lowerMessage.includes("key not valid")) {
@@ -505,6 +515,12 @@ function mergeUniqueByKey(primary = [], secondary = [], getKey = (item) => item?
 
 function hasActiveFilters(filters) {
   return Object.values(filters || {}).some(Boolean);
+}
+
+function getVisibleFolders(folders) {
+  return (Array.isArray(folders) ? folders : DEFAULT_FOLDERS).filter(
+    (folder) => !HIDDEN_FOLDER_NAMES.has(normalizeBookText(folder))
+  );
 }
 
 function normalizeBookText(text) {
@@ -642,6 +658,133 @@ function scoreGoogleBooksMatch(book, item) {
   if (item?.accessInfo?.viewability && item.accessInfo.viewability !== "NO_PAGES") {
     score += 5;
   }
+
+  return score;
+}
+
+function getGoogleBooksSimilarQuery(book) {
+  const terms = [
+    book?.genre && `subject:${book.genre}`,
+    book?.author &&
+      normalizeBookText(book.author) !== "unknown" &&
+      `inauthor:${book.author}`,
+    book?.title && `intitle:${book.title}`,
+  ].filter(Boolean);
+
+  if (terms.length) return terms.join(" ");
+
+  return [book?.title, book?.genre, book?.ageRecommendation]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function mapGoogleBookToCatalogBook(item, selectedBook) {
+  const info = item?.volumeInfo || {};
+  const categories = Array.isArray(info.categories) ? info.categories : [];
+  const title = info.title || "Recommended book";
+  const authors = Array.isArray(info.authors) && info.authors.length
+    ? info.authors.join(", ")
+    : "Unknown";
+  const averageRating = Number(info.averageRating || 0);
+
+  return enrichScannedBook({
+    title,
+    author: authors,
+    authorBio: authors === "Unknown"
+      ? "Author information unavailable."
+      : `${authors} is listed as the author on Google Books.`,
+    rating: averageRating || Number(selectedBook?.rating || 4),
+    ratingSource: averageRating ? "Google Books" : "Estimated",
+    summary: info.description || "Google Books did not provide a description for this recommendation.",
+    genre: categories[0] || selectedBook?.genre || "Book",
+    readingLevel: selectedBook?.readingLevel || "Intermediate",
+    gradeBand: selectedBook?.gradeBand || "",
+    ageRecommendation: selectedBook?.ageRecommendation || "All ages",
+    whyRead: `Recommended because it shares signals with ${selectedBook?.title || "the selected book"}.`,
+    shelfPick: averageRating >= 4 ? "Top Rated" : "Popular",
+    googleBooksId: item?.id || "",
+    googleBooksCategories: categories,
+  });
+}
+
+function scoreSimilarGoogleBook(selectedBook, item) {
+  const info = item?.volumeInfo || {};
+  const selectedTitle = normalizeBookText(selectedBook?.title);
+  const candidateTitle = normalizeBookText(info.title);
+
+  if (!candidateTitle || candidateTitle === selectedTitle) return -1;
+
+  const selectedGenre = normalizeBookText(selectedBook?.genre);
+  const selectedAuthor = normalizeBookText(selectedBook?.author);
+  const selectedAge = normalizeBookText(selectedBook?.ageRecommendation);
+  const selectedLevel = normalizeBookText(selectedBook?.readingLevel);
+  const candidateText = normalizeBookText(
+    [
+      info.title,
+      info.subtitle,
+      info.description,
+      ...(info.categories || []),
+      ...(info.authors || []),
+    ].join(" ")
+  );
+
+  let score = 0;
+  if (selectedGenre && candidateText.includes(selectedGenre)) score += 35;
+  if (
+    selectedAuthor &&
+    selectedAuthor !== "unknown" &&
+    (info.authors || []).map(normalizeBookText).some((author) => author.includes(selectedAuthor))
+  ) {
+    score += 18;
+  }
+  if (selectedAge && candidateText.includes(selectedAge)) score += 12;
+  if (selectedLevel && candidateText.includes(selectedLevel)) score += 8;
+  score += Math.min(Number(info.averageRating || 0) * 6, 30);
+  if (info.description) score += 6;
+  if ((info.categories || []).length) score += 5;
+
+  return score;
+}
+
+function scoreShelfSimilarBook(selectedBook, candidateBook) {
+  if (!selectedBook || !candidateBook) return 0;
+
+  const selectedTitle = normalizeBookText(selectedBook.title);
+  const candidateTitle = normalizeBookText(candidateBook.title);
+  if (!candidateTitle || candidateTitle === selectedTitle) return 0;
+
+  let score = 0;
+  const selectedGenre = normalizeBookText(selectedBook.genre);
+  const candidateGenre = normalizeBookText(candidateBook.genre);
+  const selectedAuthor = normalizeBookText(selectedBook.author);
+  const candidateAuthor = normalizeBookText(candidateBook.author);
+  const selectedAge = normalizeBookText(selectedBook.ageRecommendation);
+  const candidateAge = normalizeBookText(candidateBook.ageRecommendation);
+  const selectedLevel = normalizeBookText(selectedBook.readingLevel);
+  const candidateLevel = normalizeBookText(candidateBook.readingLevel);
+  const selectedGrade = normalizeBookText(selectedBook.gradeBand);
+  const candidateGrade = normalizeBookText(candidateBook.gradeBand);
+  const selectedPick = normalizeBookText(selectedBook.shelfPick);
+  const candidatePick = normalizeBookText(candidateBook.shelfPick);
+
+  if (selectedGenre && selectedGenre === candidateGenre) score += 35;
+  if (
+    selectedAuthor &&
+    selectedAuthor !== "unknown" &&
+    selectedAuthor === candidateAuthor
+  ) {
+    score += 25;
+  }
+  if (selectedAge && selectedAge === candidateAge) score += 14;
+  if (selectedLevel && selectedLevel === candidateLevel) score += 12;
+  if (selectedGrade && selectedGrade === candidateGrade) score += 10;
+  if (selectedPick && selectedPick === candidatePick) score += 8;
+
+  const ratingGap = Math.abs(
+    Number(selectedBook.rating || 0) - Number(candidateBook.rating || 0)
+  );
+  if (ratingGap <= 0.5) score += 8;
+  if (ratingGap <= 1) score += 4;
 
   return score;
 }
@@ -893,38 +1036,38 @@ function getShelfPickStyle(shelfPick) {
   if (pick.includes("popular")) {
     return {
       background: "rgba(26, 115, 232, 0.16)",
-      color: "#8ab4f8",
-      border: "1px solid rgba(138, 180, 248, 0.32)",
+      color: "#2563eb",
+      border: "1px solid rgba(37, 99, 235, 0.32)",
     };
   }
 
   if (pick.includes("top rated")) {
     return {
-      background: "rgba(251, 188, 5, 0.14)",
-      color: "#fdd663",
-      border: "1px solid rgba(251, 188, 5, 0.32)",
+      background: "rgba(245, 158, 11, 0.14)",
+      color: "#92400e",
+      border: "1px solid rgba(245, 158, 11, 0.32)",
     };
   }
 
   if (pick.includes("hidden gem")) {
     return {
-      background: "rgba(52, 168, 83, 0.14)",
-      color: "#81c995",
-      border: "1px solid rgba(52, 168, 83, 0.32)",
+      background: "rgba(24, 121, 78, 0.14)",
+      color: "#A7D7B8",
+      border: "1px solid rgba(24, 121, 78, 0.32)",
     };
   }
 
   if (pick.includes("beginner")) {
     return {
-      background: "rgba(234, 67, 53, 0.14)",
-      color: "#f28b82",
-      border: "1px solid rgba(234, 67, 53, 0.32)",
+      background: "rgba(220, 38, 38, 0.14)",
+      color: "#b91c1c",
+      border: "1px solid rgba(220, 38, 38, 0.32)",
     };
   }
 
   return {
     background: "rgba(154, 160, 166, 0.16)",
-    color: "#e8eaed",
+    color: "#243044",
     border: "1px solid rgba(154, 160, 166, 0.28)",
   };
 }
@@ -962,12 +1105,12 @@ function getTheme(book) {
   ) {
     return {
       name: "kids",
-      cardBg: "#202124",
-      imageBg: "linear-gradient(135deg, rgba(66, 133, 244, 0.18), rgba(52, 168, 83, 0.16))",
-      border: "#34373d",
-      title: "#f4f7fb",
-      badgeBg: "rgba(66, 133, 244, 0.14)",
-      badgeText: "#8ab4f8",
+      cardBg: "#ffffff",
+      imageBg: "linear-gradient(135deg, rgba(37, 99, 235, 0.18), rgba(24, 121, 78, 0.16))",
+      border: "#dde5f0",
+      title: "#172033",
+      badgeBg: "rgba(37, 99, 235, 0.14)",
+      badgeText: "#2563eb",
     };
   }
 
@@ -981,23 +1124,23 @@ function getTheme(book) {
   ) {
     return {
       name: "young",
-      cardBg: "#202124",
-      imageBg: "linear-gradient(135deg, rgba(251, 188, 5, 0.18), rgba(234, 67, 53, 0.14))",
-      border: "#34373d",
-      title: "#f4f7fb",
-      badgeBg: "rgba(251, 188, 5, 0.13)",
-      badgeText: "#fdd663",
+      cardBg: "#ffffff",
+      imageBg: "linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(220, 38, 38, 0.14))",
+      border: "#dde5f0",
+      title: "#172033",
+      badgeBg: "rgba(245, 158, 11, 0.13)",
+      badgeText: "#92400e",
     };
   }
 
   return {
     name: "teen",
-    cardBg: "#202124",
-    imageBg: "linear-gradient(135deg, rgba(66, 133, 244, 0.18), rgba(168, 85, 247, 0.14))",
-    border: "#34373d",
-    title: "#f4f7fb",
-    badgeBg: "rgba(52, 168, 83, 0.14)",
-    badgeText: "#81c995",
+    cardBg: "#ffffff",
+    imageBg: "linear-gradient(135deg, rgba(37, 99, 235, 0.18), rgba(168, 85, 247, 0.14))",
+    border: "#dde5f0",
+    title: "#172033",
+    badgeBg: "rgba(24, 121, 78, 0.14)",
+    badgeText: "#A7D7B8",
   };
 }
 
@@ -1228,6 +1371,28 @@ function matchesStructuredFilters(book, filters) {
   return true;
 }
 
+/* eslint-disable react-refresh/only-export-components */
+export {
+  cleanJsonText,
+  getBookKey,
+  getCode128Bars,
+  getContentGuidance,
+  getFriendlyScanError,
+  getSearchIntent,
+  matchesSearchIntent,
+  matchesStructuredFilters,
+  mergeUniqueByKey,
+  normalizeBookText,
+  normalizeLibraryCards,
+  normalizeSavedFiles,
+  safeParseJson,
+  sanitizeDisplayName,
+  scoreGoogleBooksMatch,
+  validateDisplayName,
+  validatePassword,
+};
+/* eslint-enable react-refresh/only-export-components */
+
 export default function App() {
   useEffect(() => {
     logEvent(analytics, "app_opened");
@@ -1282,14 +1447,19 @@ export default function App() {
   });
 
   const [selectedBook, setSelectedBook] = useState(null);
+  const [similarBooksView, setSimilarBooksView] = useState(null);
+  const [similarBooksCache, setSimilarBooksCache] = useState({});
   const [scanHistory, setScanHistory] = useState([]);
   const [folders, setFolders] = useState(DEFAULT_FOLDERS);
   const [bookFolders, setBookFolders] = useState({});
   const [activeFolder, setActiveFolder] = useState("All");
+  const [folderModal, setFolderModal] = useState({
+    isOpen: false,
+    book: null,
+    name: "",
+  });
   const [compare, setCompare] = useState([]);
   const [compareOpen, setCompareOpen] = useState(false);
-  const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
   const [geminiUsage, setGeminiUsage] = useState(getInitialGeminiUsage);
   const [previewCache, setPreviewCache] = useState({});
   const [previewModal, setPreviewModal] = useState(null);
@@ -1316,6 +1486,8 @@ export default function App() {
     imageName: "",
   });
   const [libraryCardMessage, setLibraryCardMessage] = useState("");
+  const [libraryCardLoginPromptOpen, setLibraryCardLoginPromptOpen] =
+    useState(false);
   const [openSections, setOpenSections] = useState(() => ({
     ...SECTION_DEFAULT_OPEN,
     ...readStoredJson("openSections", {}),
@@ -1381,14 +1553,26 @@ export default function App() {
     }
 
     return onAuthStateChanged(auth, async (firebaseUser) => {
-      setUser(firebaseUser);
       userDataLoadedRef.current = false;
 
-      if (!firebaseUser) return;
+      if (!firebaseUser) {
+        setUser(null);
+        return;
+      }
       if (firebaseUser.isAnonymous) {
+        setUser(firebaseUser);
         userDataLoadedRef.current = true;
         return;
       }
+      if (!firebaseUser.emailVerified) {
+        await signOut(auth);
+        setUser(null);
+        setAuthMode("signin");
+        setAuthMessage("Please verify your email before logging in.");
+        return;
+      }
+
+      setUser(firebaseUser);
 
       try {
         const userRef = doc(db, "users", firebaseUser.uid);
@@ -1796,6 +1980,7 @@ export default function App() {
 
   function getAuthErrorMessage(err) {
     const code = err?.code || "";
+    const message = String(err?.message || "");
 
     if (code.includes("invalid-credential")) return "Email or password is incorrect.";
     if (code.includes("email-already-in-use")) return "That email already has an account.";
@@ -1819,6 +2004,12 @@ export default function App() {
     }
     if (code.includes("network-request-failed")) {
       return "Firebase could not connect. Check your internet connection and try again.";
+    }
+    if (
+      message.toLowerCase().includes("no credentials available") ||
+      code.includes("credential-unavailable")
+    ) {
+      return "No Google account is available on this device, or Android Google sign-in is not fully configured yet. Sign into Google on the device, verify the Firebase Android app setup for com.shilpi.lumina, then try again.";
     }
 
     return err?.message || "Authentication failed. Please try again.";
@@ -1871,6 +2062,20 @@ export default function App() {
           displayName,
         });
         await sendEmailVerification(credential.user);
+        await signOut(auth);
+        setUser(null);
+        setAuthMode("signin");
+        setAuthMessage("Verification email sent. Please verify your email, then log in.");
+        return;
+      }
+
+      if (!credential.user.emailVerified) {
+        await sendEmailVerification(credential.user);
+        await signOut(auth);
+        setUser(null);
+        setAuthMode("signin");
+        setAuthMessage("Your email is not verified. I sent a new verification email. Please verify, then log in.");
+        return;
       }
 
       await recordSuccessfulLogin(
@@ -1878,18 +2083,12 @@ export default function App() {
           ...credential.user,
           displayName: displayName || credential.user.displayName,
         },
-        authMode === "signup" ? "email-signup" : "email"
+        "email"
       );
-      logEvent(analytics, authMode === "signup" ? "sign_up" : "login", {
+      logEvent(analytics, "login", {
         method: "email",
       });
-      setAuthMessage(
-        authMode === "signup"
-          ? "Account created. Check your email to verify your account."
-          : credential.user.emailVerified
-            ? "Signed in. Your saved list and filters will sync here."
-            : "Signed in. Please verify your email for full account protection."
-      );
+      setAuthMessage("Signed in. Your saved list and filters will sync here.");
       setCurrentPage("scan");
     } catch (err) {
       console.error("Auth failed:", err);
@@ -2070,7 +2269,10 @@ export default function App() {
 
     try {
       await sendEmailVerification(user);
-      setAuthMessage("Verification email sent. Check your inbox.");
+      await signOut(auth);
+      setUser(null);
+      setAuthMode("signin");
+      setAuthMessage("Verification email sent. Please verify your email, then log in.");
     } catch (err) {
       console.error("Email verification failed:", err);
       setAuthMessage(getAuthErrorMessage(err));
@@ -2135,7 +2337,7 @@ export default function App() {
   function requireLoginForLibraryCards() {
     setAuthMode("signin");
     setCurrentPage("account");
-    setLibraryCardMessage("Log in to add and save library cards to your account.");
+    setLibraryCardLoginPromptOpen(true);
   }
 
   function addLibraryCardFromForm(event) {
@@ -2313,7 +2515,6 @@ Do not include explanations.
     setLoading(true);
     setBooks([]);
     setPreviewCache({});
-    setAnswer("");
     setSearch("");
     setVoiceStatus("");
     setVoiceListening(false);
@@ -2439,7 +2640,7 @@ Important:
     }
   }
 
-  function handleVoiceSearch() {
+  async function handleVoiceSearch() {
     if (voiceListening) {
       recognitionRef.current?.stop();
       setVoiceListening(false);
@@ -2449,11 +2650,58 @@ Important:
 
     const SpeechRecognition =
       window.SpeechRecognition || window.webkitSpeechRecognition;
+    const microphoneSettingsMessage = isAndroidApp
+      ? "Microphone permission is needed. Open Android Settings > Apps > Lumina > Permissions > Microphone, allow it, then try again."
+      : "Microphone permission is needed. Allow microphone access for this app in your browser or device settings, then try again.";
+
+    if (isAndroidApp && NativeSpeech?.start) {
+      setVoiceListening(true);
+      setVoiceStatus("Listening...");
+      setError("");
+
+      try {
+        const result = await NativeSpeech.start({ language: "en-US" });
+        const transcript = String(result?.transcript || "").trim();
+
+        if (!transcript) {
+          setVoiceStatus("I did not catch that. Try again.");
+          return;
+        }
+
+        setSearch(transcript);
+        setVoiceStatus(`Voice searched: "${transcript}"`);
+      } catch (err) {
+        console.error("Native voice search failed:", err);
+        filterSearchRef.current?.focus();
+        setVoiceStatus(
+          String(err?.message || "").toLowerCase().includes("permission")
+            ? microphoneSettingsMessage
+            : "Voice search could not hear you. Try again."
+        );
+      } finally {
+        setVoiceListening(false);
+      }
+      return;
+    }
 
     if (!SpeechRecognition) {
       filterSearchRef.current?.focus();
-      setVoiceStatus("Voice dictation is not available in this phone view. Use the keyboard microphone or type your search.");
+      setVoiceStatus(
+        "Voice dictation is not available on this device. Type your search instead."
+      );
       return;
+    }
+
+    if (navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      } catch (err) {
+        console.error("Microphone permission failed:", err);
+        filterSearchRef.current?.focus();
+        setVoiceStatus(microphoneSettingsMessage);
+        return;
+      }
     }
 
     const recognition = new SpeechRecognition();
@@ -2489,7 +2737,7 @@ Important:
       filterSearchRef.current?.focus();
       setVoiceStatus(
         blocked
-          ? "Microphone permission is needed. You can also use the keyboard microphone."
+          ? microphoneSettingsMessage
           : "Voice search could not hear you. Try again."
       );
       setVoiceListening(false);
@@ -2551,6 +2799,26 @@ Important:
     const topBookKeys = new Set(topBooks.map(getBookKey));
     return filteredBooks.filter((book) => !topBookKeys.has(getBookKey(book)));
   }, [filteredBooks, topBooks]);
+
+  const selectedBookKey = selectedBook ? getBookKey(selectedBook) : "";
+  const similarBooksState = selectedBookKey
+    ? similarBooksCache[selectedBookKey]
+    : null;
+  const similarBooks = similarBooksState?.books || [];
+  const shelfSimilarBooks = useMemo(() => {
+    if (!selectedBookKey) return [];
+
+    return books
+      .filter((book) => getBookKey(book) !== selectedBookKey)
+      .map((book) => ({
+        book,
+        score: scoreShelfSimilarBook(selectedBook, book),
+      }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map(({ book }) => book);
+  }, [books, selectedBook, selectedBookKey]);
 
   function hasSavedPreview(book) {
     return savedFiles.some(
@@ -2615,12 +2883,29 @@ Important:
   }
 
   function createFolderForBook(book) {
-    const bookKey = getBookKey(book);
-    if (!bookKey) return;
+    setFolderModal({
+      isOpen: true,
+      book: book || null,
+      name: "",
+    });
+  }
 
-    const folderName = window.prompt("New folder name");
-    const cleanName = folderName?.trim();
+  function createFolder() {
+    setFolderModal({
+      isOpen: true,
+      book: null,
+      name: "",
+    });
+  }
 
+  function closeFolderModal() {
+    setFolderModal({ isOpen: false, book: null, name: "" });
+  }
+
+  function saveFolderFromModal(event) {
+    event.preventDefault();
+
+    const cleanName = folderModal.name.trim();
     if (!cleanName) return;
 
     const existingFolder = folders.find(
@@ -2632,16 +2917,22 @@ Important:
       setFolders((currentFolders) => [...currentFolders, nextFolder]);
     }
 
-    setBookFolders((currentFolders) => ({
-      ...currentFolders,
-      [bookKey]: nextFolder,
-    }));
     setActiveFolder(nextFolder);
+    if (folderModal.book) {
+      assignBookFolder(folderModal.book, nextFolder);
+    }
     setSaveStatus({
-      message: `${book.title} moved to ${nextFolder}.`,
-      bookKey: getSavedFileKey(book.title, "favorite"),
-      type: "favorite",
+      message: existingFolder
+        ? `${nextFolder} folder opened.`
+        : folderModal.book
+          ? `${nextFolder} folder created and ${folderModal.book.title} was added.`
+          : `${nextFolder} folder created.`,
+      bookKey: folderModal.book
+        ? getSavedFileKey(folderModal.book.title, "favorite")
+        : "folder",
+      type: folderModal.book ? "favorite" : "folder",
     });
+    closeFolderModal();
   }
 
   function handleFolderSelect(book, folderName) {
@@ -2653,37 +2944,29 @@ Important:
     assignBookFolder(book, folderName);
   }
 
-  function markBookReviewed(book) {
+  function handleSavedBookFolderSelect(savedBook, folderName) {
+    const book = savedBook?.catalogBook;
+    if (!book) return;
+
+    if (folderName === NEW_FOLDER_OPTION) {
+      createFolderForBook(book);
+      return;
+    }
+
     const bookKey = getBookKey(book);
-    if (!bookKey) return;
+    setReadingList((currentList) => {
+      if (currentList.some((saved) => getBookKey(saved) === bookKey)) {
+        return currentList;
+      }
 
-    const markReviewed = (candidateBook) =>
-      getBookKey(candidateBook) === bookKey
-        ? { ...candidateBook, reviewed: true, scanConfidence: "Reviewed" }
-        : candidateBook;
-
-    setBooks((currentBooks) => currentBooks.map(markReviewed));
-    setReadingList((currentList) => currentList.map(markReviewed));
-    setSelectedBook((currentBook) =>
-      currentBook && getBookKey(currentBook) === bookKey ? markReviewed(currentBook) : currentBook
-    );
-  }
-
-  function editBookTitle(book) {
-    const bookKey = getBookKey(book);
-    const nextTitle = window.prompt("Correct book title", book?.title || "");
-    if (!bookKey || !nextTitle?.trim()) return;
-
-    const updateTitle = (candidateBook) =>
-      getBookKey(candidateBook) === bookKey
-        ? { ...candidateBook, title: nextTitle.trim(), reviewed: true, scanConfidence: "Reviewed" }
-        : candidateBook;
-
-    setBooks((currentBooks) => currentBooks.map(updateTitle));
-    setReadingList((currentList) => currentList.map(updateTitle));
-    setSelectedBook((currentBook) =>
-      currentBook && getBookKey(currentBook) === bookKey ? updateTitle(currentBook) : currentBook
-    );
+      return [{ ...book, savedAt: new Date().toISOString() }, ...currentList];
+    });
+    assignBookFolder(book, folderName);
+    setSaveStatus({
+      message: `${book.title} added to ${folderName}.`,
+      bookKey: getSavedFileKey(book.title, "favorite"),
+      type: "favorite",
+    });
   }
 
   function getPreviewButtonState(book) {
@@ -2767,6 +3050,91 @@ Important:
     setCompare([compare[1], book]);
     setCompareOpen(true);
   }
+
+  const loadSimilarBooks = useCallback(async (book) => {
+    const bookKey = getBookKey(book);
+    if (!bookKey) return;
+
+    if (!googleBooksApiKey) {
+      setSimilarBooksCache((currentCache) => ({
+        ...currentCache,
+        [bookKey]: {
+          status: "error",
+          message:
+            "Google Books API key is not configured, so global similar books cannot be loaded.",
+          books: [],
+        },
+      }));
+      return;
+    }
+
+    setSimilarBooksCache((currentCache) => ({
+      ...currentCache,
+      [bookKey]: {
+        status: "loading",
+        message: "Finding similar books across Google Books...",
+        books: currentCache[bookKey]?.books || [],
+      },
+    }));
+
+    try {
+      const params = new URLSearchParams({
+        q: getGoogleBooksSimilarQuery(book),
+        key: googleBooksApiKey,
+        maxResults: "30",
+        printType: "books",
+        orderBy: "relevance",
+        fields:
+          "items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,description,categories,averageRating))",
+      });
+      const response = await fetch(
+        `https://www.googleapis.com/books/v1/volumes?${params}`
+      );
+
+      if (!response.ok) {
+        throw new Error("Google Books did not return recommendations right now.");
+      }
+
+      const data = await response.json();
+      const seen = new Set([normalizeBookText(book.title)]);
+      const recommendedBooks = (data.items || [])
+        .map((item) => ({
+          item,
+          score: scoreSimilarGoogleBook(book, item),
+        }))
+        .filter(({ item, score }) => {
+          const titleKey = normalizeBookText(item?.volumeInfo?.title);
+          if (score <= 0 || !titleKey || seen.has(titleKey)) return false;
+          seen.add(titleKey);
+          return true;
+        })
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map(({ item }) => mapGoogleBookToCatalogBook(item, book));
+
+      setSimilarBooksCache((currentCache) => ({
+        ...currentCache,
+        [bookKey]: {
+          status: recommendedBooks.length ? "ready" : "empty",
+          message: recommendedBooks.length
+            ? "Similar books loaded from Google Books."
+            : "No global similar books were found for this title right now.",
+          books: recommendedBooks,
+        },
+      }));
+    } catch (err) {
+      console.error("Similar books lookup failed:", err);
+      setSimilarBooksCache((currentCache) => ({
+        ...currentCache,
+        [bookKey]: {
+          status: "error",
+          message:
+            "Could not load global similar books. Check your connection and try again.",
+          books: [],
+        },
+      }));
+    }
+  }, []);
 
   const findBookPreview = useCallback(async (book) => {
     if (!googleBooksApiKey) {
@@ -3088,66 +3456,6 @@ Important:
     closePreview();
   }
 
-  async function askLibrarian() {
-    if (!isGeminiConfigured) {
-      setAnswer("Firebase is not configured yet.");
-      return;
-    }
-    if (!question.trim()) {
-      setAnswer("Please type a question first.");
-      return;
-    }
-
-    if (books.length === 0) {
-      setAnswer("Please scan a bookshelf first.");
-      return;
-    }
-
-    setLoading(true);
-    setAnswer("");
-
-    let geminiCallStarted = false;
-    try {
-      await ensureScanAuth();
-      beginGeminiCall("AI Librarian");
-      geminiCallStarted = true;
-      const result = await generateGeminiContent([
-        {
-          role: "user",
-          parts: [
-            {
-              text: `
-You are a friendly AI librarian for kids, families, and teens.
-
-Books detected:
-${JSON.stringify(books, null, 2)}
-
-User question:
-${question}
-
-Answer in a cheerful, helpful, short way. Recommend books only from the detected list.
-        `,
-            },
-          ],
-        },
-      ], {}, "AI Librarian");
-
-      const text = getGeminiText(result);
-
-      finishGeminiCall("AI Librarian", "Success", getTotalTokenCount(result));
-      geminiCallStarted = false;
-      setAnswer(text);
-    } catch (err) {
-      console.error("AI Librarian error:", err);
-      if (geminiCallStarted) {
-        finishGeminiCall("AI Librarian", "Failed");
-      }
-      setAnswer(getFriendlyScanError(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
   function renderBookCard(book, index, options = {}) {
     const theme = getTheme(book);
     const previewButton = getPreviewButtonState(book);
@@ -3176,7 +3484,6 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
         <div style={styles.metaPillRow}>
           <span style={styles.metaPill}>{confidence}</span>
-          {book.reviewed && <span style={styles.metaPill}>Reviewed</span>}
         </div>
 
         {options.compact ? (
@@ -3210,7 +3517,13 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             <p>{book.summary}</p>
 
             <div style={styles.buttonRow}>
-              <button style={styles.smallButton} onClick={() => setSelectedBook(book)}>
+              <button
+                style={styles.smallButton}
+                onClick={() => {
+                  setSelectedBook(book);
+                  setSimilarBooksView(null);
+                }}
+              >
                 🌟 Details
               </button>
 
@@ -3230,8 +3543,8 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
               <button
                 style={{
                   ...styles.smallButton,
-                  ...styles.iconButton,
-                  ...(favoriteSaved ? styles.savedButton : {}),
+                  ...styles.favoriteButton,
+                  ...(favoriteSaved ? styles.favoriteButtonSaved : {}),
                 }}
                 onClick={() => toggleReadingList(book)}
                 aria-label={favoriteSaved ? "Remove favorite" : "Add favorite"}
@@ -3246,21 +3559,13 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                 onChange={(event) => handleFolderSelect(book, event.target.value)}
                 aria-label="Book folder"
               >
-                {folders.map((folder) => (
+                {getVisibleFolders(folders).map((folder) => (
                   <option key={folder} value={folder}>
                     {folder}
                   </option>
                 ))}
                 <option value={NEW_FOLDER_OPTION}>Add new folder...</option>
               </select>
-
-              <button style={styles.smallButton} onClick={() => markBookReviewed(book)}>
-                Review
-              </button>
-
-              <button style={styles.smallButton} onClick={() => editBookTitle(book)}>
-                Edit
-              </button>
 
               <button
                 style={{
@@ -3622,11 +3927,12 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         <div style={styles.authActionRow}>
           <button
             type="button"
-            style={styles.authSecondaryButton}
+            style={styles.googleSignInButton}
             onClick={handleGoogleLogin}
             disabled={authLoading || !isFirebaseConfigured}
           >
-            Continue with Google SSO
+            <span style={styles.googleSignInIcon} aria-hidden="true">G</span>
+            <span>Continue with Google</span>
           </button>
           <button
             type="button"
@@ -3737,7 +4043,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                 <p style={styles.savedFileMeta}>
                   {canUseLibraryCards
                     ? "Take a photo or upload the card."
-                    : "Log in to save cards to your account."}
+                    : "Sign in to unlock saved library cards."}
                 </p>
               </div>
             </div>
@@ -3877,28 +4183,42 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     children,
     style = {},
     bodyStyle = {},
+    headerAction = null,
   }) {
     const isOpen = Boolean(openSections[id] ?? defaultOpen);
+    const headerButton = (
+      <button
+        type="button"
+        style={{
+          ...styles.collapsibleHeader,
+          ...(headerAction ? styles.collapsibleHeaderToggle : {}),
+        }}
+        onClick={() =>
+          setOpenSections((sections) => ({
+            ...sections,
+            [id]: !isOpen,
+          }))
+        }
+        aria-expanded={isOpen}
+      >
+        <span style={styles.collapsibleTitle}>{title}</span>
+        <span style={styles.collapsibleMeta}>
+          {meta}
+          <span style={styles.collapsibleChevron}>{isOpen ? "▲" : "▼"}</span>
+        </span>
+      </button>
+    );
 
     return (
       <section style={{ ...styles.collapsibleSection, ...style }}>
-        <button
-          type="button"
-          style={styles.collapsibleHeader}
-          onClick={() =>
-            setOpenSections((sections) => ({
-              ...sections,
-              [id]: !isOpen,
-            }))
-          }
-          aria-expanded={isOpen}
-        >
-          <span style={styles.collapsibleTitle}>{title}</span>
-          <span style={styles.collapsibleMeta}>
-            {meta}
-            <span style={styles.collapsibleChevron}>{isOpen ? "▲" : "▼"}</span>
-          </span>
-        </button>
+        {headerAction ? (
+          <div style={styles.collapsibleHeaderWithAction}>
+            {headerButton}
+            {headerAction}
+          </div>
+        ) : (
+          headerButton
+        )}
         {isOpen && <div style={{ ...styles.collapsibleBody, ...bodyStyle }}>{children}</div>}
       </section>
     );
@@ -3961,7 +4281,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
     return renderCollapsibleSection({
       id: `${sectionKey}-savedBooks`,
-      title: "Saved books",
+      title: "Saved",
       meta: `${savedBooks.length}`,
       defaultOpen: sectionKey !== "results",
       style: styles.savedFilesSection,
@@ -4022,6 +4342,27 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                 </div>
 
                 <div className="saved-file-actions" style={styles.savedFileActions}>
+                  {savedBook.catalogBook && (
+                    <select
+                      style={styles.inlineSelect}
+                      value={
+                        bookFolders[getBookKey(savedBook.catalogBook)] ||
+                        "Want to read"
+                      }
+                      onChange={(event) =>
+                        handleSavedBookFolderSelect(savedBook, event.target.value)
+                      }
+                      aria-label={`Folder for ${savedBook.bookTitle}`}
+                    >
+                      {getVisibleFolders(folders).map((folder) => (
+                        <option key={folder} value={folder}>
+                          {folder}
+                        </option>
+                      ))}
+                      <option value={NEW_FOLDER_OPTION}>Add new folder...</option>
+                    </select>
+                  )}
+
                   {canOpenSavedBookPreview(savedBook) ? (
                     <button
                       style={styles.smallButton}
@@ -4097,9 +4438,9 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
   function triggerMagicBurst(event) {
     setSavedArtActive(true);
-    handleIdleBookTap(event, "#fbbc05");
-    window.setTimeout(() => handleIdleBookTap(event, "#8ab4f8"), 120);
-    window.setTimeout(() => handleIdleBookTap(event, "#81c995"), 220);
+    handleIdleBookTap(event, "#f59e0b");
+    window.setTimeout(() => handleIdleBookTap(event, "#2563eb"), 120);
+    window.setTimeout(() => handleIdleBookTap(event, "#A7D7B8"), 220);
     window.setTimeout(() => setSavedArtActive(false), 520);
   }
 
@@ -4110,10 +4451,9 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     setLoading(false);
     setError("");
     setSelectedBook(null);
+    setSimilarBooksView(null);
     setCompare([]);
     setCompareOpen(false);
-    setQuestion("");
-    setAnswer("");
     setPreviewCache({});
     previewCacheRef.current = {};
     setPreviewModal(null);
@@ -4135,41 +4475,53 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     : "Sign in to sync your saved books and filters across devices.";
 
   function renderSavedBooksPage() {
-    const folderTabs = ["All", ...folders];
+    const visibleFolders = getVisibleFolders(folders);
+    const folderTabs = ["All", ...visibleFolders];
     const libraryBooks = readingList.filter((book) => {
       if (activeFolder === "All") return true;
       return (bookFolders[getBookKey(book)] || "Want to read") === activeFolder;
     });
-    const recentScans = scanHistory.slice(0, 5);
 
     return (
       <section style={styles.pagePanel}>
         <div style={styles.authHeader}>
-          <h2 style={styles.authTitle}>Saved books</h2>
+          <h2 style={styles.authTitle}>Saved</h2>
         </div>
 
         {renderCollapsibleSection({
           id: "libraryFolders",
           title: "Folders",
-          meta: `${libraryBooks.length} books`,
+          meta: `${folderTabs.length}`,
           defaultOpen: true,
           children: (
             <>
-              <div style={styles.pageNav}>
-                {folderTabs.map((folder) => (
-                  <button
-                    key={folder}
-                    type="button"
-                    style={{
-                      ...styles.navButton,
-                      ...(activeFolder === folder ? styles.navButtonActive : {}),
-                    }}
-                    onClick={() => setActiveFolder(folder)}
-                  >
-                    {folder}
-                  </button>
-                ))}
+              <div style={styles.folderToolbar}>
+                <div style={styles.folderTabs}>
+                  {folderTabs.map((folder) => (
+                    <button
+                      key={folder}
+                      type="button"
+                      style={{
+                        ...styles.navButton,
+                        ...(activeFolder === folder ? styles.navButtonActive : {}),
+                      }}
+                      onClick={() => setActiveFolder(folder)}
+                    >
+                      {folder}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  style={styles.authSecondaryButton}
+                  onClick={createFolder}
+                >
+                  Add folder
+                </button>
               </div>
+              {saveStatus?.type === "folder" && (
+                <p style={styles.saveStatus}>{saveStatus.message}</p>
+              )}
               {libraryBooks.length === 0 ? (
                 <p style={styles.countText}>No saved books in this folder yet.</p>
               ) : (
@@ -4184,49 +4536,6 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         })}
 
         {renderSavedFiles("library")}
-
-        {renderCollapsibleSection({
-          id: "scanHistory",
-          title: "History",
-          meta: `${recentScans.length}`,
-          defaultOpen: false,
-          children:
-            recentScans.length === 0 ? (
-              <p style={styles.countText}>No scans yet. Scan a shelf to build history.</p>
-            ) : (
-              <div style={styles.savedFileList}>
-                {recentScans.map((scan) => (
-                  <div key={scan.id} style={styles.savedFileItem}>
-                    <div style={styles.savedFileInfo}>
-                      <strong>{scan.imageName || "Bookshelf scan"}</strong>
-                      <p style={styles.savedFileMeta}>
-                        {getDisplayTime(scan.createdAt)} · {scan.bookCount} books
-                      </p>
-                    </div>
-                    <div style={styles.savedFileActions}>
-                      <button
-                        type="button"
-                        style={styles.smallButton}
-                        onClick={() => {
-                          setBooks(Array.isArray(scan.books) ? scan.books : []);
-                          setCurrentPage("scan");
-                        }}
-                      >
-                        Reopen
-                      </button>
-                      <button
-                        type="button"
-                        style={styles.deleteButton}
-                        onClick={() => setScanHistory((history) => history.filter((item) => item.id !== scan.id))}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ),
-        })}
       </section>
     );
   }
@@ -4387,19 +4696,19 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         <span className="idle-scan idle-scan-two" />
         <span
           className="idle-book idle-book-blue"
-          onPointerDown={(event) => handleIdleBookTap(event, "#8ab4f8")}
+          onPointerDown={(event) => handleIdleBookTap(event, "#2563eb")}
         />
         <span
           className="idle-book idle-book-green"
-          onPointerDown={(event) => handleIdleBookTap(event, "#81c995")}
+          onPointerDown={(event) => handleIdleBookTap(event, "#A7D7B8")}
         />
         <span
           className="idle-book idle-book-yellow"
-          onPointerDown={(event) => handleIdleBookTap(event, "#fdd663")}
+          onPointerDown={(event) => handleIdleBookTap(event, "#92400e")}
         />
         <span
           className="idle-book idle-book-red"
-          onPointerDown={(event) => handleIdleBookTap(event, "#f28b82")}
+          onPointerDown={(event) => handleIdleBookTap(event, "#b91c1c")}
         />
         <span className="idle-star idle-star-one" />
         <span className="idle-star idle-star-two" />
@@ -4433,42 +4742,20 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             </div>
             <h1 style={styles.title}>Lumina</h1>
           </button>
-          <p style={styles.subtitle}>
-            Snap a bookshelf and let Lumina guide you to your next favorite
-            book. Scan books, discover ratings, and find your next read.
-          </p>
+          {currentPage === "scan" && (
+            <p style={styles.subtitle}>
+              Take a photo of your bookshelf and Lumina will identify the books,
+              organize them, and help you choose what to read next.
+            </p>
+          )}
         </div>
 
-        <div style={styles.heroArt}>
-          <span style={styles.agentDot} />
-          <span>AI shelf scan</span>
+        <div style={styles.heroArt} aria-hidden="true">
+          <span style={{ ...styles.agentDot, background: "#2563eb" }} />
+          <span style={{ ...styles.agentDot, background: "#18794e" }} />
+          <span style={{ ...styles.agentDot, background: "#f59e0b" }} />
         </div>
       </div>
-
-      <nav style={styles.pageNav} aria-label="App pages">
-        {[
-          ["scan", "Scan"],
-          ["saved", "Saved books"],
-          ["account", "Account"],
-        ].map(([pageId, label]) => (
-          <button
-            key={pageId}
-            type="button"
-            style={{
-              ...styles.navButton,
-              ...(currentPage === pageId ? styles.navButtonActive : {}),
-            }}
-            onClick={() => setCurrentPage(pageId)}
-          >
-            {label}
-          </button>
-        ))}
-        {syncUser && (
-          <button type="button" style={styles.navButton} onClick={handleSignOut}>
-            Sign Out
-          </button>
-        )}
-      </nav>
 
       {currentPage === "account" && renderAccountPage()}
       {currentPage === "saved" && renderSavedBooksPage()}
@@ -4497,22 +4784,6 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             onChange={(e) => handleImage(e.target.files[0])}
           />
         </label>
-
-        <label
-          style={{
-            ...styles.galleryButton,
-            ...(!isFirebaseConfigured ? styles.scanButtonNeedsAuth : {}),
-          }}
-          onClick={handleScanPickerClick}
-        >
-          🖼️ Pick from Gallery
-          <input
-            type="file"
-            accept="image/*"
-            hidden
-            onChange={(e) => handleImage(e.target.files[0])}
-          />
-        </label>
       </div>
 
       {renderFilterControls()}
@@ -4521,69 +4792,68 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         <img src={imagePreview} alt="Bookshelf" style={styles.preview} />
       )}
 
-      {loading && <p style={styles.loading}>Scanning bookshelf...</p>}
       {error && <p style={styles.error}>{error}</p>}
 
       {books.length === 0 && renderSavedFiles("home")}
 
       {books.length > 0 && (
         <>
-          <div style={styles.searchRow}>
-            <input
-              style={styles.askInput}
-              placeholder="🤖 Ask for recommendations..."
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") askLibrarian();
-              }}
-            />
-
-            <button style={styles.askButton} onClick={askLibrarian}>
-              Ask
-            </button>
-          </div>
-
-          {answer && <div style={styles.answer}>🤖 {answer}</div>}
-
-          {renderCollapsibleSection({
-            id: "topPicks",
-            title: "Top picks",
-            meta: `${topBooks.length}`,
-            defaultOpen: true,
-            children:
-              topBooks.length === 0 ? (
-                <p style={styles.error}>No top picks match your search.</p>
-              ) : (
+          {filteredBooks.length === 1 ? (
+            renderCollapsibleSection({
+              id: "scannedBook",
+              title: "Scanned book",
+              meta: "1",
+              defaultOpen: true,
+              children: (
                 <div style={styles.grid}>
-                  {topBooks.map((book, index) =>
-                    renderBookCard(book, index, { prefix: "top", topPick: true })
+                  {filteredBooks.map((book, index) =>
+                    renderBookCard(book, index, { prefix: "single", topPick: true })
                   )}
                 </div>
               ),
-          })}
+            })
+          ) : (
+            <>
+              {renderCollapsibleSection({
+                id: "topPicks",
+                title: "Top picks",
+                meta: `${topBooks.length}`,
+                defaultOpen: true,
+                children:
+                  topBooks.length === 0 ? (
+                    <p style={styles.error}>No top picks match your search.</p>
+                  ) : (
+                    <div style={styles.grid}>
+                      {topBooks.map((book, index) =>
+                        renderBookCard(book, index, { prefix: "top", topPick: true })
+                      )}
+                    </div>
+                  ),
+              })}
 
-          {renderCollapsibleSection({
-            id: "detectedBooks",
-            title: "Detected books",
-            meta: `${detectedBooks.length}`,
-            defaultOpen: true,
-            children: (
-              <div style={styles.grid}>
-                {detectedBooks.length === 0 ? (
-                  <p style={styles.error}>
-                    {filteredBooks.length === 0
-                      ? "No matching books found. Try another word."
-                      : "All matching books are already shown in Top Picks."}
-                  </p>
-                ) : (
-                  detectedBooks.map((book, index) =>
-                    renderBookCard(book, index, { prefix: "detected" })
-                  )
-                )}
-              </div>
-            ),
-          })}
+              {renderCollapsibleSection({
+                id: "detectedBooks",
+                title: "Detected books",
+                meta: `${detectedBooks.length}`,
+                defaultOpen: true,
+                children: (
+                  <div style={styles.grid}>
+                    {detectedBooks.length === 0 ? (
+                      <p style={styles.error}>
+                        {filteredBooks.length === 0
+                          ? "No matching books found. Try another word."
+                          : "All matching books are already shown in Top Picks."}
+                      </p>
+                    ) : (
+                      detectedBooks.map((book, index) =>
+                        renderBookCard(book, index, { prefix: "detected" })
+                      )
+                    )}
+                  </div>
+                ),
+              })}
+            </>
+          )}
 
           {renderSavedFiles("results")}
         </>
@@ -4742,6 +5012,68 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                   style: styles.detailCollapse,
                 })}
 
+                {similarBooksView &&
+                  renderCollapsibleSection({
+                    id: "detailSimilarBooks",
+                    title:
+                      similarBooksView === "shelf"
+                        ? "Similar books on this shelf"
+                        : "Similar books in general",
+                    meta: `${
+                      similarBooksView === "shelf"
+                        ? shelfSimilarBooks.length
+                        : similarBooks.length
+                    }`,
+                    defaultOpen: true,
+                    headerAction: (
+                      <button
+                        type="button"
+                        style={styles.collapsibleCloseButton}
+                        onClick={() => setSimilarBooksView(null)}
+                        aria-label="Close similar books"
+                        title="Close similar books"
+                      >
+                        X
+                      </button>
+                    ),
+                    children:
+                      similarBooksView === "shelf" ? (
+                        shelfSimilarBooks.length === 0 ? (
+                          <p style={styles.countText}>
+                            No close shelf matches were found in this scan.
+                          </p>
+                        ) : (
+                          <div style={styles.grid}>
+                            {shelfSimilarBooks.map((book, index) =>
+                              renderBookCard(book, index, {
+                                prefix: "shelf-similar",
+                                compact: true,
+                              })
+                            )}
+                          </div>
+                        )
+                      ) : similarBooksState?.status === "loading" ? (
+                        <p style={styles.countText}>
+                          Finding similar books across Google Books...
+                        </p>
+                      ) : similarBooks.length === 0 ? (
+                        <p style={styles.countText}>
+                          {similarBooksState?.message ||
+                            "No global similar books were found for this title right now."}
+                        </p>
+                      ) : (
+                        <div style={styles.grid}>
+                          {similarBooks.map((book, index) =>
+                            renderBookCard(book, index, {
+                              prefix: "similar",
+                              compact: true,
+                            })
+                          )}
+                        </div>
+                      ),
+                    style: styles.detailCollapse,
+                  })}
+
                 {detailSaveStatus && (
                   <p style={styles.saveStatus}>{detailSaveStatus}</p>
                 )}
@@ -4757,12 +5089,39 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                     {detailsSaved ? "Saved Details" : "Save Details"}
                   </button>
 
-                  <button style={styles.secondaryButton} onClick={() => markBookReviewed(selectedBook)}>
-                    Mark reviewed
+                  <button
+                    style={{
+                      ...styles.secondaryButton,
+                      ...(similarBooksView === "shelf" ? styles.selectedButton : {}),
+                    }}
+                    onClick={() => {
+                      setSimilarBooksView((currentView) =>
+                        currentView === "shelf" ? null : "shelf"
+                      );
+                    }}
+                  >
+                    Similar on shelf
                   </button>
 
-                  <button style={styles.secondaryButton} onClick={() => editBookTitle(selectedBook)}>
-                    Edit title
+                  <button
+                    style={{
+                      ...styles.secondaryButton,
+                      ...(similarBooksView === "global" ? styles.selectedButton : {}),
+                    }}
+                    onClick={() => {
+                      const nextOpen = similarBooksView !== "global";
+                      setSimilarBooksView(nextOpen ? "global" : null);
+                      if (
+                        nextOpen &&
+                        selectedBook &&
+                        selectedBookKey &&
+                        !similarBooksCache[selectedBookKey]?.status
+                      ) {
+                        loadSimilarBooks(selectedBook);
+                      }
+                    }}
+                  >
+                    Similar in general
                   </button>
 
                   <button
@@ -4776,6 +5135,27 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             </div>
           );
         })()}
+
+      {loading && (
+        <div style={styles.processingOverlay}>
+          <section
+            style={styles.processingPanel}
+            role="status"
+            aria-live="polite"
+            aria-label="Processing bookshelf photo"
+          >
+            <div className="scan-processing-orbit" aria-hidden="true">
+              <span className="scan-processing-core" />
+            </div>
+            <div style={styles.processingCopy}>
+              <h2 style={styles.processingTitle}>Building your book list...</h2>
+              <p style={styles.processingText}>
+                Lumina is reading the shelf, matching titles, and preparing recommendations.
+              </p>
+            </div>
+          </section>
+        </div>
+      )}
 
       {currentPage === "scan" && compareOpen && compare.length > 0 && (
         <div style={styles.modal}>
@@ -4838,6 +5218,96 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {libraryCardLoginPromptOpen && (
+        <div style={styles.modal}>
+          <div style={styles.promptModalContent}>
+            <div style={styles.promptIcon} aria-hidden="true">▤</div>
+            <h2 style={styles.modalTitle}>Log in to save library cards</h2>
+            <p style={styles.previewSubtitle}>
+              Sign in to add your library card barcode and keep it synced with
+              your Lumina account.
+            </p>
+            <div style={styles.previewActionRow}>
+              <button
+                type="button"
+                style={styles.googleSignInButton}
+                onClick={() => {
+                  setLibraryCardLoginPromptOpen(false);
+                  handleGoogleLogin();
+                }}
+                disabled={authLoading || !isFirebaseConfigured}
+              >
+                <span style={styles.googleSignInIcon} aria-hidden="true">G</span>
+                <span>Continue with Google</span>
+              </button>
+              <button
+                type="button"
+                style={styles.secondaryButton}
+                onClick={() => {
+                  setLibraryCardLoginPromptOpen(false);
+                  setAuthMode("signin");
+                  setCurrentPage("account");
+                }}
+              >
+                Use email login
+              </button>
+              <button
+                type="button"
+                style={styles.authTextButton}
+                onClick={() => setLibraryCardLoginPromptOpen(false)}
+              >
+                Not now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {folderModal.isOpen && (
+        <div style={styles.modal}>
+          <form style={styles.promptModalContent} onSubmit={saveFolderFromModal}>
+            <div style={styles.promptIcon} aria-hidden="true">▤</div>
+            <h2 style={styles.modalTitle}>Add folder</h2>
+            <p style={styles.previewSubtitle}>
+              {folderModal.book
+                ? `Create a folder for ${folderModal.book.title}.`
+                : "Create a folder to organize saved books."}
+            </p>
+            <label style={styles.filterLabel}>
+              <span>Folder name</span>
+              <input
+                style={styles.filterControl}
+                value={folderModal.name}
+                placeholder="Summer reads"
+                autoFocus
+                onChange={(event) =>
+                  setFolderModal((currentModal) => ({
+                    ...currentModal,
+                    name: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <div style={styles.previewActionRow}>
+              <button
+                type="submit"
+                style={styles.authPrimaryButton}
+                disabled={!folderModal.name.trim()}
+              >
+                Save folder
+              </button>
+              <button
+                type="button"
+                style={styles.secondaryButton}
+                onClick={closeFolderModal}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
@@ -4973,6 +5443,38 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           </div>
         </div>
       )}
+
+      <nav style={styles.bottomTabs} aria-label="App pages">
+        {[
+          ["scan", "⌕", "Scan", "#2563eb", "rgba(37, 99, 235, 0.13)"],
+          ["saved", "▤", "Saved", "#18794e", "rgba(24, 121, 78, 0.13)"],
+          ["account", "◉", "Account", "#b45309", "rgba(245, 158, 11, 0.15)"],
+        ].map(([pageId, icon, label, accent, accentBg]) => {
+          const isActive = currentPage === pageId;
+
+          return (
+            <button
+              key={pageId}
+              type="button"
+              style={{
+                ...styles.bottomTabButton,
+                color: isActive ? accent : "#64748b",
+                ...(isActive
+                  ? {
+                      ...styles.bottomTabButtonActive,
+                      background: accentBg,
+                      border: `1px solid ${accent}`,
+                    }
+                  : {}),
+              }}
+              onClick={() => setCurrentPage(pageId)}
+            >
+              <span style={{ ...styles.bottomTabIcon, color: accent }}>{icon}</span>
+              <span style={styles.bottomTabLabel}>{label}</span>
+            </button>
+          );
+        })}
+      </nav>
     </div>
   );
 }
@@ -4987,16 +5489,17 @@ const styles = {
     boxSizing: "border-box",
     maxWidth: "1000px",
     margin: "auto",
-    padding: "clamp(14px, 4vw, 24px)",
+    padding: "clamp(14px, 4vw, 24px) clamp(14px, 4vw, 24px) 112px",
     fontFamily:
       '"Google Sans Flex", "Google Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     background:
-      "linear-gradient(180deg, rgba(18, 19, 23, 0.9), rgba(24, 25, 29, 0.96))",
-    color: "#cdd4dc",
+      "linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(248, 250, 252, 0.9))",
+    color: "#4f5f73",
+    backdropFilter: "blur(12px)",
   },
   hero: {
     background:
-      "linear-gradient(135deg, rgba(50, 121, 249, 0.18), rgba(33, 34, 38, 0.92) 45%, rgba(18, 19, 23, 0.96)), linear-gradient(90deg, rgba(50, 121, 249, 0.22), rgba(52, 168, 83, 0.16), rgba(251, 188, 5, 0.12), rgba(234, 67, 53, 0.14))",
+      "radial-gradient(circle at 16% 10%, rgba(37, 99, 235, 0.18), transparent 13rem), radial-gradient(circle at 86% 18%, rgba(245, 158, 11, 0.14), transparent 12rem), linear-gradient(135deg, rgba(255, 255, 255, 0.88), rgba(239, 246, 255, 0.72) 56%, rgba(255, 255, 255, 0.9))",
     borderRadius: "8px",
     padding: "clamp(22px, 6vw, 32px) clamp(16px, 5vw, 24px)",
     display: "flex",
@@ -5006,10 +5509,10 @@ const styles = {
     flexWrap: "wrap",
     minWidth: 0,
     maxWidth: "100%",
-    boxShadow: "0 24px 80px rgba(0, 0, 0, 0.36)",
-    color: "#ffffff",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    backdropFilter: "blur(18px)",
+    boxShadow: "0 28px 90px rgba(31, 45, 61, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.78)",
+    color: "#172033",
+    border: "1px solid rgba(37, 99, 235, 0.16)",
+    backdropFilter: "blur(22px)",
   },
   heroText: {
     flex: "1 1 260px",
@@ -5036,9 +5539,9 @@ const styles = {
     alignItems: "center",
     justifyContent: "center",
     background:
-      "linear-gradient(145deg, rgba(50, 121, 249, 0.34), rgba(33, 34, 38, 0.88))",
+      "linear-gradient(145deg, rgba(37, 99, 235, 0.22), rgba(255, 255, 255, 0.92))",
     boxShadow:
-      "0 0 0 1px rgba(230, 234, 240, 0.18), 0 12px 32px rgba(50, 121, 249, 0.28)",
+      "0 0 0 1px rgba(230, 234, 240, 0.18), 0 12px 32px rgba(37, 99, 235, 0.28)",
     overflow: "hidden",
     flex: "0 0 auto",
   },
@@ -5049,7 +5552,7 @@ const styles = {
     width: "24px",
     height: "28px",
     borderRadius: "3px 7px 7px 3px",
-    background: "linear-gradient(135deg, #4285f4 0%, #34a853 100%)",
+    background: "linear-gradient(135deg, #2563eb 0%, #18794e 100%)",
     boxShadow: "inset 4px 0 0 rgba(255, 255, 255, 0.24)",
   },
   logoSpine: {
@@ -5068,7 +5571,7 @@ const styles = {
     width: "19px",
     height: "19px",
     borderRadius: "999px",
-    border: "3px solid #fbbc05",
+    border: "3px solid #f59e0b",
     background: "rgba(17, 18, 20, 0.7)",
   },
   logoBeam: {
@@ -5078,21 +5581,21 @@ const styles = {
     width: "18px",
     height: "4px",
     borderRadius: "999px",
-    background: "#ea4335",
+    background: "#dc2626",
     transform: "rotate(43deg)",
     transformOrigin: "left center",
   },
   title: {
     margin: 0,
     fontSize: "clamp(28px, 6vw, 38px)",
-    color: "#f8fbff",
+    color: "#172033",
     lineHeight: 1.15,
     wordBreak: "break-word",
     fontWeight: "650",
     letterSpacing: 0,
   },
   subtitle: {
-    color: "#cdd4dc",
+    color: "#4f5f73",
     fontSize: "16px",
     lineHeight: 1.5,
     marginTop: "12px",
@@ -5101,44 +5604,49 @@ const styles = {
   heroArt: {
     display: "inline-flex",
     alignItems: "center",
-    gap: "10px",
-    minHeight: "40px",
-    padding: "10px 14px",
-    borderRadius: "999px",
-    border: "1px solid rgba(230, 234, 240, 0.14)",
-    background: "rgba(18, 19, 23, 0.62)",
-    color: "#e6eaf0",
+    justifyContent: "center",
+    gap: "12px",
+    width: "112px",
+    height: "58px",
+    borderRadius: "8px",
+    border: "1px solid rgba(37, 99, 235, 0.2)",
+    background:
+      "linear-gradient(135deg, rgba(255, 255, 255, 0.68), rgba(239, 246, 255, 0.72))",
+    color: "#243044",
     fontSize: "14px",
     fontWeight: "650",
     flex: "0 0 auto",
     maxWidth: "100%",
     minWidth: 0,
+    boxShadow: "0 18px 44px rgba(37, 99, 235, 0.12)",
   },
   agentDot: {
-    width: "10px",
-    height: "10px",
+    width: "12px",
+    height: "12px",
     borderRadius: "999px",
-    background: "#3279f9",
-    boxShadow: "0 0 0 4px rgba(50, 121, 249, 0.14)",
+    background: "#2563eb",
+    boxShadow: "0 0 0 4px rgba(37, 99, 235, 0.14)",
   },
   homeGreetingPanel: {
     margin: "18px 0 0",
-    padding: "14px 16px",
+    padding: "16px",
     borderRadius: "8px",
-    background: "rgba(52, 168, 83, 0.1)",
-    border: "1px solid rgba(52, 168, 83, 0.24)",
+    background:
+      "linear-gradient(135deg, rgba(255, 255, 255, 0.78), rgba(232, 240, 254, 0.72))",
+    border: "1px solid rgba(37, 99, 235, 0.16)",
     textAlign: "left",
+    boxShadow: "0 18px 48px rgba(31, 45, 61, 0.08)",
   },
   homeGreetingTitle: {
     margin: 0,
-    color: "#e6f4ea",
+    color: "#172033",
     fontSize: "20px",
     lineHeight: 1.25,
     fontWeight: "750",
   },
   homeGreetingText: {
     margin: "6px 0 0",
-    color: "#cdd4dc",
+    color: "#4f5f73",
     fontSize: "14px",
     lineHeight: 1.45,
   },
@@ -5158,63 +5666,112 @@ const styles = {
     minWidth: 0,
     maxWidth: "100%",
   },
+  bottomTabs: {
+    position: "fixed",
+    left: "50%",
+    bottom: "max(12px, env(safe-area-inset-bottom))",
+    transform: "translateX(-50%)",
+    width: "min(94vw, 560px)",
+    minHeight: "78px",
+    display: "grid",
+    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gap: "10px",
+    padding: "9px",
+    borderRadius: "8px",
+    border: "1px solid rgba(34, 49, 71, 0.12)",
+    background: "rgba(255, 255, 255, 0.94)",
+    boxShadow: "0 18px 48px rgba(31, 45, 61, 0.18)",
+    backdropFilter: "blur(18px)",
+    zIndex: 1200,
+  },
+  bottomTabButton: {
+    minWidth: 0,
+    minHeight: "60px",
+    display: "grid",
+    justifyItems: "center",
+    alignContent: "center",
+    gap: "4px",
+    padding: "7px 6px",
+    borderRadius: "8px",
+    border: "1px solid transparent",
+    background: "transparent",
+    color: "#718096",
+    cursor: "pointer",
+    fontWeight: "780",
+  },
+  bottomTabButtonActive: {
+    border: "1px solid rgba(37, 99, 235, 0.24)",
+    background: "rgba(37, 99, 235, 0.12)",
+    color: "#1d4ed8",
+  },
+  bottomTabIcon: {
+    fontSize: "31px",
+    lineHeight: 1,
+    fontWeight: "850",
+  },
+  bottomTabLabel: {
+    fontSize: "13px",
+    lineHeight: 1.1,
+    fontWeight: "800",
+  },
+  folderToolbar: {
+    display: "grid",
+    gridTemplateColumns: "1fr auto",
+    gap: "10px",
+    alignItems: "start",
+    margin: "16px 0",
+  },
+  folderTabs: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flexWrap: "wrap",
+    minWidth: 0,
+  },
   navButton: {
     minWidth: 0,
     minHeight: "36px",
     padding: "8px 12px",
     borderRadius: "8px",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    background: "rgba(33, 34, 38, 0.72)",
-    color: "#e6eaf0",
+    border: "1px solid rgba(34, 49, 71, 0.12)",
+    background: "rgba(255, 255, 255, 0.92)",
+    color: "#243044",
     cursor: "pointer",
     fontWeight: "700",
     fontSize: "13px",
     whiteSpace: "normal",
   },
   navButtonActive: {
-    background: "rgba(50, 121, 249, 0.18)",
-    border: "1px solid rgba(50, 121, 249, 0.42)",
-    color: "#d8e7ff",
+    background: "rgba(37, 99, 235, 0.18)",
+    border: "1px solid rgba(37, 99, 235, 0.42)",
+    color: "#1d4ed8",
   },
   cameraButton: {
     flex: "1 1 min(100%, 150px)",
     minWidth: 0,
     textAlign: "center",
-    background: "#3279f9",
+    background: "#2563eb",
     color: "#ffffff",
     padding: "12px 20px",
     borderRadius: "8px",
-    border: "1px solid #3279f9",
+    border: "1px solid #2563eb",
     cursor: "pointer",
     fontWeight: "650",
     transition: "background 0.2s",
-    boxShadow: "0 12px 30px rgba(50, 121, 249, 0.28)",
-  },
-  galleryButton: {
-    flex: "1 1 min(100%, 180px)",
-    minWidth: 0,
-    textAlign: "center",
-    background: "rgba(33, 34, 38, 0.86)",
-    color: "#e6eaf0",
-    padding: "12px 20px",
-    borderRadius: "8px",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    cursor: "pointer",
-    fontWeight: "650",
-    transition: "background 0.2s",
+    boxShadow: "0 12px 30px rgba(37, 99, 235, 0.28)",
   },
   scanButtonNeedsAuth: {
     opacity: 0.78,
-    border: "1px solid rgba(251, 188, 5, 0.36)",
+    border: "1px solid rgba(245, 158, 11, 0.36)",
     boxShadow: "none",
   },
   voiceStatus: {
     margin: "10px 0 14px",
     padding: "10px 12px",
     borderRadius: "8px",
-    background: "rgba(33, 34, 38, 0.72)",
-    border: "1px solid rgba(230, 234, 240, 0.1)",
-    color: "#e6eaf0",
+    background: "rgba(255, 255, 255, 0.92)",
+    border: "1px solid rgba(34, 49, 71, 0.1)",
+    color: "#243044",
     fontSize: "13px",
     fontWeight: "650",
     textAlign: "left",
@@ -5223,9 +5780,9 @@ const styles = {
     margin: "0 0 24px",
     padding: "14px",
     borderRadius: "8px",
-    background: "rgba(33, 34, 38, 0.78)",
-    border: "1px solid rgba(230, 234, 240, 0.1)",
-    boxShadow: "0 14px 34px rgba(0, 0, 0, 0.16)",
+    background: "rgba(255, 255, 255, 0.94)",
+    border: "1px solid rgba(34, 49, 71, 0.1)",
+    boxShadow: "0 14px 34px rgba(31, 45, 61, 0.09)",
     textAlign: "left",
   },
   filterHeader: {
@@ -5243,13 +5800,13 @@ const styles = {
     gap: "8px",
     border: "none",
     background: "transparent",
-    color: "#f8f9fc",
+    color: "#172033",
     cursor: "pointer",
     textAlign: "left",
   },
   filterTitle: {
     margin: 0,
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "18px",
     lineHeight: 1.2,
     fontWeight: "650",
@@ -5262,14 +5819,14 @@ const styles = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    background: "rgba(50, 121, 249, 0.18)",
-    color: "#d8e7ff",
-    border: "1px solid rgba(50, 121, 249, 0.32)",
+    background: "rgba(37, 99, 235, 0.18)",
+    color: "#1d4ed8",
+    border: "1px solid rgba(37, 99, 235, 0.32)",
     fontSize: "12px",
     fontWeight: "750",
   },
   filterChevron: {
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "11px",
     fontWeight: "750",
   },
@@ -5281,7 +5838,7 @@ const styles = {
   },
   filterSummary: {
     margin: "10px 0 0",
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "13px",
     lineHeight: 1.35,
   },
@@ -5293,12 +5850,12 @@ const styles = {
   filterLabel: {
     display: "grid",
     gap: "6px",
-    color: "#cdd4dc",
+    color: "#4f5f73",
     fontSize: "12px",
     fontWeight: "750",
   },
   passwordHint: {
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "12px",
     fontWeight: "650",
     lineHeight: 1.4,
@@ -5309,10 +5866,10 @@ const styles = {
     minHeight: "40px",
     padding: "9px 10px",
     borderRadius: "8px",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    background: "#18191d",
-    color: "#e6eaf0",
-    outlineColor: "#3279f9",
+    border: "1px solid rgba(34, 49, 71, 0.12)",
+    background: "#f6f8fb",
+    color: "#243044",
+    outlineColor: "#2563eb",
     fontSize: "14px",
     fontWeight: "600",
     boxSizing: "border-box",
@@ -5321,9 +5878,9 @@ const styles = {
     minHeight: "34px",
     padding: "7px 10px",
     borderRadius: "6px",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    background: "rgba(230, 234, 240, 0.06)",
-    color: "#e6eaf0",
+    border: "1px solid rgba(34, 49, 71, 0.12)",
+    background: "rgba(34, 49, 71, 0.06)",
+    color: "#243044",
     cursor: "pointer",
     fontWeight: "700",
     fontSize: "13px",
@@ -5332,9 +5889,9 @@ const styles = {
     margin: "24px 0",
     padding: "18px",
     borderRadius: "8px",
-    background: "rgba(33, 34, 38, 0.84)",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    boxShadow: "0 18px 42px rgba(0, 0, 0, 0.18)",
+    background: "rgba(255, 255, 255, 0.96)",
+    border: "1px solid rgba(34, 49, 71, 0.12)",
+    boxShadow: "0 18px 42px rgba(31, 45, 61, 0.1)",
     textAlign: "left",
   },
   authHeader: {
@@ -5342,13 +5899,13 @@ const styles = {
   },
   authTitle: {
     margin: "0 0 6px",
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "24px",
     lineHeight: 1.2,
     fontWeight: "700",
   },
   authSubtitle: {
-    color: "#cdd4dc",
+    color: "#4f5f73",
     fontSize: "14px",
     lineHeight: 1.5,
   },
@@ -5356,9 +5913,9 @@ const styles = {
     margin: "0 0 14px",
     padding: "10px 12px",
     borderRadius: "8px",
-    border: "1px solid rgba(251, 188, 5, 0.34)",
-    background: "rgba(251, 188, 5, 0.1)",
-    color: "#fdd663",
+    border: "1px solid rgba(245, 158, 11, 0.34)",
+    background: "rgba(245, 158, 11, 0.1)",
+    color: "#92400e",
     fontSize: "13px",
     fontWeight: "650",
   },
@@ -5370,8 +5927,8 @@ const styles = {
     minHeight: "42px",
     padding: "10px 14px",
     borderRadius: "8px",
-    border: "1px solid #3279f9",
-    background: "#3279f9",
+    border: "1px solid #2563eb",
+    background: "#2563eb",
     color: "#ffffff",
     cursor: "pointer",
     fontWeight: "750",
@@ -5380,17 +5937,48 @@ const styles = {
     minHeight: "40px",
     padding: "9px 12px",
     borderRadius: "8px",
-    border: "1px solid rgba(230, 234, 240, 0.14)",
-    background: "rgba(230, 234, 240, 0.06)",
-    color: "#e6eaf0",
+    border: "1px solid rgba(34, 49, 71, 0.14)",
+    background: "rgba(34, 49, 71, 0.06)",
+    color: "#243044",
     cursor: "pointer",
     fontWeight: "700",
+  },
+  googleSignInButton: {
+    minHeight: "42px",
+    padding: "9px 14px",
+    borderRadius: "8px",
+    border: "1px solid #d7e0ec",
+    background: "#ffffff",
+    color: "#172033",
+    cursor: "pointer",
+    fontWeight: "750",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "10px",
+    boxShadow: "0 8px 20px rgba(31, 45, 61, 0.08)",
+  },
+  googleSignInIcon: {
+    width: "22px",
+    height: "22px",
+    borderRadius: "999px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    color: "#2563eb",
+    background:
+      "conic-gradient(from 0deg, #2563eb, #18794e, #f59e0b, #dc2626, #2563eb)",
+    WebkitBackgroundClip: "text",
+    backgroundClip: "text",
+    fontSize: "18px",
+    fontWeight: "900",
+    lineHeight: 1,
   },
   authTextButton: {
     padding: "6px 0",
     border: "none",
     background: "transparent",
-    color: "#8ab4f8",
+    color: "#2563eb",
     cursor: "pointer",
     fontWeight: "700",
     textAlign: "left",
@@ -5414,9 +6002,9 @@ const styles = {
     margin: "12px 0 0",
     padding: "10px 12px",
     borderRadius: "8px",
-    border: "1px solid rgba(52, 168, 83, 0.34)",
-    background: "rgba(52, 168, 83, 0.12)",
-    color: "#ceead6",
+    border: "1px solid rgba(24, 121, 78, 0.34)",
+    background: "rgba(24, 121, 78, 0.12)",
+    color: "#18794e",
     fontSize: "13px",
     fontWeight: "650",
   },
@@ -5454,8 +6042,8 @@ const styles = {
     gap: "12px",
     padding: "12px",
     borderRadius: "8px",
-    background: "rgba(230, 234, 240, 0.05)",
-    border: "1px solid rgba(230, 234, 240, 0.1)",
+    background: "rgba(34, 49, 71, 0.05)",
+    border: "1px solid rgba(34, 49, 71, 0.1)",
   },
   walletAddIcon: {
     width: "38px",
@@ -5464,7 +6052,7 @@ const styles = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    background: "#3279f9",
+    background: "#2563eb",
     color: "#ffffff",
     fontSize: "24px",
     fontWeight: "700",
@@ -5472,7 +6060,7 @@ const styles = {
   },
   walletAddTitle: {
     margin: 0,
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "16px",
     lineHeight: 1.2,
   },
@@ -5489,10 +6077,10 @@ const styles = {
     padding: "18px",
     borderRadius: "8px",
     background:
-      "linear-gradient(135deg, #202124 0%, #2a2d33 52%, #17191d 100%)",
-    border: "1px solid rgba(230, 234, 240, 0.14)",
-    boxShadow: "0 18px 38px rgba(0, 0, 0, 0.24)",
-    color: "#f8f9fc",
+      "linear-gradient(135deg, #ffffff 0%, #eef5ff 52%, #f8fafc 100%)",
+    border: "1px solid rgba(34, 49, 71, 0.14)",
+    boxShadow: "0 18px 38px rgba(31, 45, 61, 0.13)",
+    color: "#172033",
     cursor: "pointer",
     overflow: "hidden",
     textAlign: "left",
@@ -5504,11 +6092,11 @@ const styles = {
     bottom: 0,
     width: "8px",
     background:
-      "linear-gradient(180deg, #4285f4, #34a853 38%, #fbbc05 70%, #ea4335)",
+      "linear-gradient(180deg, #2563eb, #1d4ed8 54%, #18794e)",
   },
   walletEyebrow: {
     margin: "0 0 18px",
-    color: "#bdc1c6",
+    color: "#5f6f86",
     fontSize: "12px",
     fontWeight: "750",
     textTransform: "uppercase",
@@ -5516,7 +6104,7 @@ const styles = {
   },
   walletMaskedNumber: {
     margin: "18px 0 0",
-    color: "#e6eaf0",
+    color: "#243044",
     fontSize: "15px",
     fontWeight: "700",
     fontFamily: "ui-monospace, Consolas, monospace",
@@ -5525,7 +6113,7 @@ const styles = {
     position: "absolute",
     right: "14px",
     bottom: "12px",
-    color: "#8ab4f8",
+    color: "#2563eb",
     fontSize: "13px",
     fontWeight: "750",
   },
@@ -5536,7 +6124,7 @@ const styles = {
   },
   libraryCardName: {
     margin: 0,
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "22px",
     lineHeight: 1.2,
     overflowWrap: "anywhere",
@@ -5554,8 +6142,8 @@ const styles = {
   libraryCardPhotoPreview: {
     padding: "10px",
     borderRadius: "8px",
-    background: "rgba(230, 234, 240, 0.05)",
-    border: "1px solid rgba(230, 234, 240, 0.1)",
+    background: "rgba(34, 49, 71, 0.05)",
+    border: "1px solid rgba(34, 49, 71, 0.1)",
   },
   libraryCardPhoto: {
     display: "block",
@@ -5564,7 +6152,7 @@ const styles = {
     objectFit: "contain",
     borderRadius: "8px",
     background: "#ffffff",
-    border: "1px solid rgba(230, 234, 240, 0.14)",
+    border: "1px solid rgba(34, 49, 71, 0.14)",
     marginTop: "12px",
   },
   libraryCardModalContent: {
@@ -5573,12 +6161,12 @@ const styles = {
     boxSizing: "border-box",
     maxHeight: "90vh",
     overflow: "auto",
-    background: "#202124",
+    background: "#ffffff",
     borderRadius: "8px",
     padding: "18px",
-    border: "1px solid #34373d",
+    border: "1px solid #dde5f0",
     boxShadow: "0 26px 70px rgba(0,0,0,0.45)",
-    color: "#e8eaed",
+    color: "#243044",
     textAlign: "left",
   },
   libraryCardFullPhoto: {
@@ -5595,16 +6183,16 @@ const styles = {
     margin: "20px 0",
     padding: "14px",
     borderRadius: "8px",
-    background: "rgba(33, 34, 38, 0.72)",
-    border: "1px solid rgba(230, 234, 240, 0.1)",
-    boxShadow: "0 14px 32px rgba(0, 0, 0, 0.14)",
+    background: "rgba(255, 255, 255, 0.92)",
+    border: "1px solid rgba(34, 49, 71, 0.1)",
+    boxShadow: "0 14px 32px rgba(31, 45, 61, 0.08)",
     textAlign: "left",
   },
   collapsibleSection: {
     margin: "14px 0",
     borderRadius: "8px",
-    background: "rgba(24, 25, 29, 0.86)",
-    border: "1px solid rgba(230, 234, 240, 0.11)",
+    background: "rgba(255, 255, 255, 0.96)",
+    border: "1px solid rgba(34, 49, 71, 0.11)",
     overflow: "hidden",
     textAlign: "left",
   },
@@ -5617,14 +6205,24 @@ const styles = {
     gap: "12px",
     padding: "12px 14px",
     border: "none",
-    background: "rgba(230, 234, 240, 0.035)",
-    color: "#f8f9fc",
+    background: "rgba(34, 49, 71, 0.035)",
+    color: "#172033",
     cursor: "pointer",
     textAlign: "left",
   },
+  collapsibleHeaderWithAction: {
+    display: "flex",
+    alignItems: "stretch",
+    background: "rgba(34, 49, 71, 0.035)",
+  },
+  collapsibleHeaderToggle: {
+    flex: "1 1 auto",
+    minWidth: 0,
+    background: "transparent",
+  },
   collapsibleTitle: {
     minWidth: 0,
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "16px",
     fontWeight: "760",
     overflowWrap: "anywhere",
@@ -5634,14 +6232,29 @@ const styles = {
     alignItems: "center",
     justifyContent: "flex-end",
     gap: "8px",
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "12px",
     fontWeight: "750",
     whiteSpace: "nowrap",
   },
   collapsibleChevron: {
-    color: "#8ab4f8",
+    color: "#2563eb",
     fontSize: "11px",
+  },
+  collapsibleCloseButton: {
+    width: "36px",
+    height: "36px",
+    alignSelf: "center",
+    marginRight: "10px",
+    borderRadius: "6px",
+    border: "1px solid rgba(34, 49, 71, 0.14)",
+    background: "#ffffff",
+    color: "#172033",
+    cursor: "pointer",
+    fontSize: "16px",
+    fontWeight: "800",
+    lineHeight: 1,
+    flex: "0 0 auto",
   },
   collapsibleBody: {
     padding: "14px",
@@ -5657,9 +6270,9 @@ const styles = {
     minHeight: "38px",
     padding: "8px 12px",
     borderRadius: "8px",
-    border: "1px solid rgba(50, 121, 249, 0.42)",
-    background: "rgba(50, 121, 249, 0.18)",
-    color: "#d8e7ff",
+    border: "1px solid rgba(37, 99, 235, 0.42)",
+    background: "rgba(37, 99, 235, 0.18)",
+    color: "#1d4ed8",
     textDecoration: "none",
     cursor: "pointer",
     fontWeight: "750",
@@ -5674,25 +6287,25 @@ const styles = {
   developerStatCard: {
     padding: "12px",
     borderRadius: "8px",
-    border: "1px solid rgba(230, 234, 240, 0.1)",
-    background: "#18191d",
+    border: "1px solid rgba(34, 49, 71, 0.1)",
+    background: "#f6f8fb",
   },
   developerStatLabel: {
     display: "block",
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "12px",
     fontWeight: "750",
     marginBottom: "6px",
   },
   developerStatValue: {
     display: "block",
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "28px",
     lineHeight: 1.1,
   },
   developerStatValueSmall: {
     display: "block",
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "14px",
     lineHeight: 1.3,
     overflowWrap: "anywhere",
@@ -5704,19 +6317,19 @@ const styles = {
   developerIpRow: {
     display: "grid",
     gap: "3px",
-    color: "#f8f9fc",
+    color: "#172033",
     fontSize: "13px",
     lineHeight: 1.3,
     overflowWrap: "anywhere",
   },
   detailCollapse: {
     margin: "12px 0",
-    background: "#171717",
-    border: "1px solid #34373d",
+    background: "#f8fafc",
+    border: "1px solid #dde5f0",
   },
   detailText: {
     margin: 0,
-    color: "#dfe4ea",
+    color: "#38475f",
     lineHeight: 1.5,
     overflowWrap: "anywhere",
   },
@@ -5724,37 +6337,64 @@ const styles = {
     display: "grid",
     gap: "12px",
   },
-  askButton: {
-    background: "#34a853",
-    color: "#ffffff",
-    padding: "12px 18px",
-    borderRadius: "8px",
-    border: "none",
-    cursor: "pointer",
-    fontWeight: "600",
-  },
   preview: {
     width: "100%",
     maxHeight: "350px",
     objectFit: "cover",
     borderRadius: "8px",
     marginBottom: "20px",
-    border: "1px solid #3c4043",
+    border: "1px solid #d7e0ec",
     boxShadow: "0 16px 36px rgba(0,0,0,0.22)",
   },
   loading: {
     fontWeight: "600",
-    color: "#8ab4f8",
+    color: "#2563eb",
+  },
+  processingOverlay: {
+    position: "fixed",
+    inset: 0,
+    zIndex: 1200,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "22px",
+    background: "rgba(15, 23, 42, 0.34)",
+    backdropFilter: "blur(8px)",
+  },
+  processingPanel: {
+    display: "grid",
+    gridTemplateColumns: "auto minmax(0, 1fr)",
+    alignItems: "center",
+    gap: "16px",
+    width: "min(100%, 430px)",
+    margin: 0,
+    padding: "18px",
+    borderRadius: "8px",
+    border: "1px solid rgba(37, 99, 235, 0.22)",
+    background:
+      "linear-gradient(135deg, rgba(239, 246, 255, 0.96), rgba(255, 255, 255, 0.98))",
+    boxShadow: "0 18px 42px rgba(31, 45, 61, 0.12)",
+    textAlign: "left",
+  },
+  processingCopy: {
+    minWidth: 0,
+  },
+  processingTitle: {
+    margin: 0,
+    color: "#172033",
+    fontSize: "20px",
+    lineHeight: 1.2,
+    fontWeight: "760",
+  },
+  processingText: {
+    margin: "6px 0 0",
+    color: "#4f5f73",
+    fontSize: "14px",
+    lineHeight: 1.45,
   },
   error: {
-    color: "#f28b82",
+    color: "#b91c1c",
     fontWeight: "600",
-  },
-  searchRow: {
-    display: "flex",
-    gap: "10px",
-    margin: "24px 0",
-    flexWrap: "wrap",
   },
   filterComposer: {
     width: "100%",
@@ -5764,8 +6404,8 @@ const styles = {
     gap: "8px",
     padding: "6px",
     borderRadius: "8px",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    background: "#202124",
+    border: "1px solid rgba(34, 49, 71, 0.12)",
+    background: "#ffffff",
   },
   filterSearchInput: {
     flex: 1,
@@ -5774,7 +6414,7 @@ const styles = {
     border: "none",
     fontSize: "16px",
     background: "transparent",
-    color: "#e8eaed",
+    color: "#243044",
     outline: "none",
   },
   iconComposerButton: {
@@ -5782,61 +6422,41 @@ const styles = {
     height: "36px",
     flex: "0 0 36px",
     borderRadius: "8px",
-    border: "1px solid rgba(251, 188, 5, 0.34)",
-    background: "rgba(251, 188, 5, 0.12)",
-    color: "#fff4c2",
+    border: "1px solid rgba(245, 158, 11, 0.34)",
+    background: "rgba(245, 158, 11, 0.12)",
+    color: "#92400e",
     cursor: "pointer",
     fontSize: "16px",
     fontWeight: "750",
   },
   iconComposerButtonActive: {
-    background: "rgba(234, 67, 53, 0.2)",
-    color: "#fce8e6",
-    border: "1px solid rgba(234, 67, 53, 0.48)",
-    boxShadow: "0 0 0 4px rgba(234, 67, 53, 0.14)",
+    background: "rgba(220, 38, 38, 0.2)",
+    color: "#b91c1c",
+    border: "1px solid rgba(220, 38, 38, 0.48)",
+    boxShadow: "0 0 0 4px rgba(220, 38, 38, 0.14)",
   },
   sendComposerButton: {
     width: "36px",
     height: "36px",
     flex: "0 0 36px",
     borderRadius: "8px",
-    border: "1px solid #3279f9",
-    background: "#3279f9",
+    border: "1px solid #2563eb",
+    background: "#2563eb",
     color: "#ffffff",
     cursor: "pointer",
     fontSize: "20px",
     lineHeight: 1,
     fontWeight: "800",
   },
-  askInput: {
-    flex: 1,
-    minWidth: "220px",
-    padding: "12px",
-    borderRadius: "8px",
-    border: "1px solid #3c4043",
-    fontSize: "16px",
-    background: "#202124",
-    color: "#e8eaed",
-    outlineColor: "#1a73e8",
-  },
-  answer: {
-    padding: "16px",
-    background: "rgba(52, 168, 83, 0.12)",
-    borderRadius: "8px",
-    whiteSpace: "pre-wrap",
-    marginBottom: "24px",
-    border: "1px solid rgba(52, 168, 83, 0.34)",
-    color: "#ceead6",
-  },
   sectionTitle: {
-    color: "#f1f3f4",
+    color: "#172033",
     marginTop: "32px",
     marginBottom: "14px",
     fontWeight: "650",
     clear: "both",
   },
   countText: {
-    color: "#9aa0a6",
+    color: "#718096",
     fontWeight: "500",
   },
   savedFilesSection: {
@@ -5846,9 +6466,9 @@ const styles = {
     maxWidth: "100%",
     boxSizing: "border-box",
     borderRadius: "8px",
-    background: "#202124",
-    border: "1px solid #34373d",
-    boxShadow: "0 12px 28px rgba(0, 0, 0, 0.14)",
+    background: "#ffffff",
+    border: "1px solid #dde5f0",
+    boxShadow: "0 12px 28px rgba(31, 45, 61, 0.08)",
     textAlign: "left",
   },
   savedFilesTop: {
@@ -5861,10 +6481,10 @@ const styles = {
     position: "relative",
     width: "64px",
     height: "56px",
-    border: "1px solid rgba(138, 180, 248, 0.24)",
+    border: "1px solid rgba(37, 99, 235, 0.24)",
     borderRadius: "8px",
     background: "linear-gradient(145deg, rgba(26, 115, 232, 0.18), rgba(23, 23, 23, 0.88))",
-    boxShadow: "0 14px 32px rgba(0, 0, 0, 0.22)",
+    boxShadow: "0 14px 32px rgba(31, 45, 61, 0.12)",
     cursor: "pointer",
     overflow: "hidden",
     flex: "0 0 auto",
@@ -5876,7 +6496,7 @@ const styles = {
     width: "13px",
     height: "32px",
     borderRadius: "3px",
-    background: "linear-gradient(180deg, #4285f4, #8ab4f8)",
+    background: "linear-gradient(180deg, #2563eb, #2563eb)",
   },
   savedArtBookTwo: {
     position: "absolute",
@@ -5885,7 +6505,7 @@ const styles = {
     width: "13px",
     height: "38px",
     borderRadius: "3px",
-    background: "linear-gradient(180deg, #fbbc05, #fdd663)",
+    background: "linear-gradient(180deg, #f59e0b, #92400e)",
   },
   savedArtBookThree: {
     position: "absolute",
@@ -5894,7 +6514,7 @@ const styles = {
     width: "13px",
     height: "28px",
     borderRadius: "3px",
-    background: "linear-gradient(180deg, #34a853, #81c995)",
+    background: "linear-gradient(180deg, #18794e, #A7D7B8)",
   },
   savedArtSpark: {
     position: "absolute",
@@ -5903,8 +6523,8 @@ const styles = {
     width: "8px",
     height: "8px",
     borderRadius: "999px",
-    background: "#ea4335",
-    boxShadow: "0 0 18px #ea4335",
+    background: "#dc2626",
+    boxShadow: "0 0 18px #dc2626",
   },
   fileCountBadge: {
     minWidth: "28px",
@@ -5914,7 +6534,7 @@ const styles = {
     alignItems: "center",
     justifyContent: "center",
     background: "rgba(26, 115, 232, 0.16)",
-    color: "#8ab4f8",
+    color: "#2563eb",
     fontWeight: "700",
     fontSize: "13px",
   },
@@ -5922,9 +6542,9 @@ const styles = {
     padding: "10px 12px",
     margin: "8px 0 12px",
     borderRadius: "8px",
-    background: "rgba(52, 168, 83, 0.12)",
-    border: "1px solid rgba(52, 168, 83, 0.34)",
-    color: "#ceead6",
+    background: "rgba(24, 121, 78, 0.12)",
+    border: "1px solid rgba(24, 121, 78, 0.34)",
+    color: "#18794e",
     fontWeight: "600",
   },
   savedFileList: {
@@ -5939,9 +6559,9 @@ const styles = {
     minWidth: 0,
     padding: "12px",
     borderRadius: "8px",
-    background: "#171717",
-    border: "1px solid #34373d",
-    color: "#e8eaed",
+    background: "#f8fafc",
+    border: "1px solid #dde5f0",
+    color: "#243044",
   },
   savedFileInfo: {
     minWidth: 0,
@@ -5952,7 +6572,7 @@ const styles = {
     padding: 0,
     border: "none",
     background: "transparent",
-    color: "#e8eaed",
+    color: "#243044",
     cursor: "pointer",
     font: "inherit",
     fontWeight: "700",
@@ -5974,9 +6594,9 @@ const styles = {
     minWidth: 0,
     padding: "8px 10px",
     borderRadius: "6px",
-    border: "1px solid rgba(251, 188, 5, 0.28)",
-    background: "rgba(251, 188, 5, 0.1)",
-    color: "#fdd663",
+    border: "1px solid rgba(245, 158, 11, 0.28)",
+    background: "rgba(245, 158, 11, 0.1)",
+    color: "#92400e",
     fontWeight: "600",
     fontSize: "13px",
     textAlign: "center",
@@ -5984,16 +6604,16 @@ const styles = {
   deleteButton: {
     padding: "8px 12px",
     borderRadius: "6px",
-    border: "1px solid rgba(234, 67, 53, 0.35)",
-    background: "rgba(234, 67, 53, 0.14)",
-    color: "#f28b82",
+    border: "1px solid rgba(220, 38, 38, 0.35)",
+    background: "rgba(220, 38, 38, 0.14)",
+    color: "#b91c1c",
     cursor: "pointer",
     fontWeight: "600",
     fontSize: "14px",
   },
   savedFileMeta: {
     marginTop: "4px",
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "13px",
   },
   grid: {
@@ -6008,9 +6628,9 @@ const styles = {
     minWidth: 0,
     borderRadius: "8px",
     padding: "20px",
-    boxShadow: "0 16px 36px rgba(0, 0, 0, 0.18)",
+    boxShadow: "0 16px 36px rgba(31, 45, 61, 0.1)",
     transition: "transform 0.15s ease, box-shadow 0.15s ease",
-    color: "#bdc1c6",
+    color: "#5f6f86",
     minHeight: "100%",
     textAlign: "left",
   },
@@ -6031,7 +6651,7 @@ const styles = {
     marginBottom: "12px",
     border: "1px solid rgba(255, 255, 255, 0.06)",
     overflow: "hidden",
-    background: "linear-gradient(135deg, rgba(66, 133, 244, 0.18), rgba(52, 168, 83, 0.14), rgba(251, 188, 5, 0.12))",
+    background: "linear-gradient(135deg, rgba(37, 99, 235, 0.18), rgba(24, 121, 78, 0.14), rgba(245, 158, 11, 0.12))",
   },
   cardBookOne: {
     position: "absolute",
@@ -6040,7 +6660,7 @@ const styles = {
     width: "18px",
     height: "38px",
     borderRadius: "4px",
-    background: "linear-gradient(180deg, #4285f4, #8ab4f8)",
+    background: "linear-gradient(180deg, #2563eb, #2563eb)",
     transform: "rotate(-8deg)",
   },
   cardBookTwo: {
@@ -6050,7 +6670,7 @@ const styles = {
     width: "18px",
     height: "44px",
     borderRadius: "4px",
-    background: "linear-gradient(180deg, #fbbc05, #fdd663)",
+    background: "linear-gradient(180deg, #f59e0b, #92400e)",
   },
   cardBookThree: {
     position: "absolute",
@@ -6059,7 +6679,7 @@ const styles = {
     width: "18px",
     height: "36px",
     borderRadius: "4px",
-    background: "linear-gradient(180deg, #34a853, #81c995)",
+    background: "linear-gradient(180deg, #18794e, #A7D7B8)",
     transform: "rotate(7deg)",
   },
   cardLens: {
@@ -6069,12 +6689,12 @@ const styles = {
     width: "20px",
     height: "20px",
     borderRadius: "999px",
-    border: "3px solid #ea4335",
+    border: "3px solid #dc2626",
     background: "rgba(17, 18, 20, 0.65)",
-    boxShadow: "0 0 18px rgba(234, 67, 53, 0.36)",
+    boxShadow: "0 0 18px rgba(220, 38, 38, 0.36)",
   },
   rating: {
-    color: "#fdd663",
+    color: "#92400e",
     fontWeight: "600",
   },
   badge: {
@@ -6099,9 +6719,9 @@ const styles = {
     minHeight: "24px",
     padding: "4px 8px",
     borderRadius: "999px",
-    background: "rgba(50, 121, 249, 0.14)",
-    border: "1px solid rgba(50, 121, 249, 0.3)",
-    color: "#d8e7ff",
+    background: "rgba(37, 99, 235, 0.14)",
+    border: "1px solid rgba(37, 99, 235, 0.3)",
+    color: "#1d4ed8",
     fontSize: "12px",
     fontWeight: "750",
   },
@@ -6109,9 +6729,9 @@ const styles = {
     minHeight: "36px",
     padding: "7px 8px",
     borderRadius: "8px",
-    border: "1px solid rgba(230, 234, 240, 0.14)",
-    background: "#18191d",
-    color: "#e6eaf0",
+    border: "1px solid rgba(34, 49, 71, 0.14)",
+    background: "#f6f8fb",
+    color: "#243044",
     fontWeight: "700",
   },
   buttonRow: {
@@ -6127,9 +6747,9 @@ const styles = {
     minHeight: "38px",
     padding: "8px 10px",
     borderRadius: "6px",
-    border: "1px solid #3c4043",
-    background: "#171717",
-    color: "#e8eaed",
+    border: "1px solid #d7e0ec",
+    background: "#f8fafc",
+    color: "#243044",
     cursor: "pointer",
     fontWeight: "600",
     fontSize: "13px",
@@ -6142,20 +6762,34 @@ const styles = {
     fontSize: "18px",
     lineHeight: 1,
   },
+  favoriteButton: {
+    border: "1px solid rgba(220, 38, 38, 0.26)",
+    background: "rgba(220, 38, 38, 0.06)",
+    color: "#dc2626",
+    fontSize: "19px",
+    lineHeight: 1,
+    boxShadow: "0 8px 20px rgba(220, 38, 38, 0.08)",
+  },
+  favoriteButtonSaved: {
+    border: "1px solid rgba(220, 38, 38, 0.48)",
+    background: "linear-gradient(135deg, #dc2626, #b91c1c)",
+    color: "#ffffff",
+    boxShadow: "0 12px 28px rgba(220, 38, 38, 0.24)",
+  },
   savedButton: {
-    border: "1px solid rgba(52, 168, 83, 0.44)",
-    background: "rgba(52, 168, 83, 0.16)",
-    color: "#ceead6",
+    border: "1px solid rgba(24, 121, 78, 0.44)",
+    background: "rgba(24, 121, 78, 0.16)",
+    color: "#18794e",
   },
   selectedButton: {
-    border: "1px solid rgba(138, 180, 248, 0.46)",
+    border: "1px solid rgba(37, 99, 235, 0.46)",
     background: "rgba(26, 115, 232, 0.18)",
-    color: "#d2e3fc",
+    color: "#1d4ed8",
   },
   disabledButton: {
     border: "1px solid rgba(154, 160, 166, 0.22)",
     background: "rgba(154, 160, 166, 0.1)",
-    color: "#9aa0a6",
+    color: "#718096",
     cursor: "not-allowed",
   },
   compareTray: {
@@ -6167,9 +6801,9 @@ const styles = {
     margin: "28px 0",
     padding: "16px",
     borderRadius: "8px",
-    background: "#202124",
-    border: "1px solid #34373d",
-    boxShadow: "0 12px 28px rgba(0, 0, 0, 0.14)",
+    background: "#ffffff",
+    border: "1px solid #dde5f0",
+    boxShadow: "0 12px 28px rgba(31, 45, 61, 0.08)",
     textAlign: "left",
   },
   compareTrayActions: {
@@ -6197,25 +6831,25 @@ const styles = {
   compareLabel: {
     padding: "10px",
     borderRadius: "8px",
-    background: "#171717",
-    border: "1px solid #34373d",
-    color: "#9aa0a6",
+    background: "#f8fafc",
+    border: "1px solid #dde5f0",
+    color: "#718096",
     fontWeight: "700",
   },
   compareValue: {
     padding: "10px",
     borderRadius: "8px",
-    background: "#171717",
-    border: "1px solid #34373d",
-    color: "#e8eaed",
+    background: "#f8fafc",
+    border: "1px solid #dde5f0",
+    color: "#243044",
     overflowWrap: "anywhere",
   },
   compareValueStrong: {
     padding: "10px",
     borderRadius: "8px",
     background: "rgba(26, 115, 232, 0.14)",
-    border: "1px solid rgba(138, 180, 248, 0.3)",
-    color: "#e8eaed",
+    border: "1px solid rgba(37, 99, 235, 0.3)",
+    color: "#243044",
     fontWeight: "800",
     overflowWrap: "anywhere",
   },
@@ -6232,42 +6866,68 @@ const styles = {
     zIndex: 1000,
   },
   modalContent: {
-    background: "#202124",
+    background: "#ffffff",
     padding: "28px",
     borderRadius: "8px",
     maxWidth: "620px",
     width: "100%",
     boxSizing: "border-box",
-    boxShadow: "0 28px 70px rgba(0, 0, 0, 0.42)",
-    color: "#bdc1c6",
+    boxShadow: "0 28px 70px rgba(31, 45, 61, 0.18)",
+    color: "#5f6f86",
   },
   compareModalContent: {
-    background: "#202124",
+    background: "#ffffff",
     padding: "18px",
     borderRadius: "8px",
     maxWidth: "760px",
     width: "min(100%, 760px)",
     boxSizing: "border-box",
     maxHeight: "88vh",
-    boxShadow: "0 28px 70px rgba(0, 0, 0, 0.42)",
-    color: "#bdc1c6",
-    border: "1px solid #34373d",
+    boxShadow: "0 28px 70px rgba(31, 45, 61, 0.18)",
+    color: "#5f6f86",
+    border: "1px solid #dde5f0",
     overflow: "hidden",
     display: "flex",
     flexDirection: "column",
   },
   previewModalContent: {
-    background: "#202124",
+    background: "#ffffff",
     padding: "20px",
     borderRadius: "8px",
     maxWidth: "900px",
     width: "100%",
     boxSizing: "border-box",
     maxHeight: "92vh",
-    boxShadow: "0 28px 70px rgba(0, 0, 0, 0.42)",
-    color: "#bdc1c6",
-    border: "1px solid #34373d",
+    boxShadow: "0 28px 70px rgba(31, 45, 61, 0.18)",
+    color: "#5f6f86",
+    border: "1px solid #dde5f0",
     overflow: "auto",
+  },
+  promptModalContent: {
+    background: "#ffffff",
+    padding: "24px",
+    borderRadius: "8px",
+    maxWidth: "420px",
+    width: "min(100%, 420px)",
+    boxSizing: "border-box",
+    boxShadow: "0 28px 70px rgba(31, 45, 61, 0.18)",
+    color: "#243044",
+    border: "1px solid #dde5f0",
+    textAlign: "left",
+  },
+  promptIcon: {
+    width: "54px",
+    height: "54px",
+    borderRadius: "8px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: "14px",
+    color: "#18794e",
+    background: "rgba(24, 121, 78, 0.12)",
+    border: "1px solid rgba(24, 121, 78, 0.22)",
+    fontSize: "30px",
+    fontWeight: "850",
   },
   modalHeader: {
     display: "flex",
@@ -6292,7 +6952,7 @@ const styles = {
     width: "58px",
     height: "34px",
     borderRadius: "999px",
-    border: "2px solid rgba(138, 180, 248, 0.48)",
+    border: "2px solid rgba(37, 99, 235, 0.48)",
     transform: "rotate(-24deg)",
   },
   detailBookCore: {
@@ -6302,9 +6962,9 @@ const styles = {
     width: "21px",
     height: "32px",
     borderRadius: "3px 7px 7px 3px",
-    background: "linear-gradient(135deg, #4285f4, #34a853)",
+    background: "linear-gradient(135deg, #2563eb, #18794e)",
     boxShadow:
-      "inset 4px 0 0 rgba(255, 255, 255, 0.24), 0 10px 24px rgba(66, 133, 244, 0.28)",
+      "inset 4px 0 0 rgba(255, 255, 255, 0.24), 0 10px 24px rgba(37, 99, 235, 0.28)",
   },
   detailLensCore: {
     position: "absolute",
@@ -6313,7 +6973,7 @@ const styles = {
     width: "18px",
     height: "18px",
     borderRadius: "999px",
-    border: "3px solid #fbbc05",
+    border: "3px solid #f59e0b",
     background: "rgba(17, 18, 20, 0.74)",
   },
   detailSparkOne: {
@@ -6323,8 +6983,8 @@ const styles = {
     width: "7px",
     height: "7px",
     borderRadius: "999px",
-    background: "#ea4335",
-    boxShadow: "0 0 18px #ea4335",
+    background: "#dc2626",
+    boxShadow: "0 0 18px #dc2626",
   },
   detailSparkTwo: {
     position: "absolute",
@@ -6333,8 +6993,8 @@ const styles = {
     width: "8px",
     height: "8px",
     borderRadius: "999px",
-    background: "#81c995",
-    boxShadow: "0 0 18px #81c995",
+    background: "#A7D7B8",
+    boxShadow: "0 0 18px #A7D7B8",
   },
   modalTitle: {
     margin: 0,
@@ -6351,7 +7011,7 @@ const styles = {
   },
   previewSubtitle: {
     marginTop: "6px",
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "14px",
   },
   closeIconButton: {
@@ -6359,21 +7019,21 @@ const styles = {
     height: "40px",
     borderRadius: "6px",
     border: "1px solid rgba(248, 249, 250, 0.28)",
-    background: "#303134",
-    color: "#f8fafd",
+    background: "#ffffff",
+    color: "#172033",
     cursor: "pointer",
     fontWeight: "700",
     fontSize: "18px",
     flex: "0 0 auto",
-    boxShadow: "0 8px 20px rgba(0, 0, 0, 0.22)",
+    boxShadow: "0 8px 20px rgba(31, 45, 61, 0.12)",
   },
   previewFrame: {
     width: "100%",
     height: "min(68vh, 680px)",
     minHeight: "min(420px, 58vh)",
-    border: "1px solid #3c4043",
+    border: "1px solid #d7e0ec",
     borderRadius: "8px",
-    background: "#171717",
+    background: "#f8fafc",
   },
   previewMessage: {
     minHeight: "240px",
@@ -6382,14 +7042,14 @@ const styles = {
     justifyContent: "center",
     padding: "24px",
     borderRadius: "8px",
-    background: "#171717",
-    border: "1px solid #34373d",
-    color: "#e8eaed",
+    background: "#f8fafc",
+    border: "1px solid #dde5f0",
+    color: "#243044",
     textAlign: "center",
   },
   previewHelpText: {
     marginTop: "10px",
-    color: "#9aa0a6",
+    color: "#718096",
     fontSize: "13px",
   },
   previewActionRow: {
@@ -6400,11 +7060,11 @@ const styles = {
   },
   secondaryButton: {
     width: "100%",
-    background: "#171717",
-    color: "#e8eaed",
+    background: "#f8fafc",
+    color: "#243044",
     padding: "12px",
     borderRadius: "8px",
-    border: "1px solid #3c4043",
+    border: "1px solid #d7e0ec",
     cursor: "pointer",
     fontWeight: "600",
   },
@@ -6414,14 +7074,14 @@ const styles = {
     gap: "12px",
   },
   detailMiniCard: {
-    background: "#171717",
+    background: "#f8fafc",
     borderRadius: "8px",
     padding: "12px",
-    border: "1px solid #34373d",
+    border: "1px solid #dde5f0",
   },
   closeButton: {
     width: "100%",
-    background: "#1a73e8",
+    background: "#1d4ed8",
     color: "#ffffff",
     padding: "12px",
     borderRadius: "8px",

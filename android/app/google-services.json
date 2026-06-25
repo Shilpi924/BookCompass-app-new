@@ -14,11 +14,64 @@
       },
       "oauth_client": [
         {
+          "client_id": "49061491719-4rp2tm65c9ugm5u0vi02o7kcgcklv8or.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.shilpi.geminibookfinder",
+            "certificate_hash": "26e779ba5c44d788feaccf1124dcce10221441da"
+          }
+        },
+        {
           "client_id": "49061491719-j2h9qqbufqqmmfvfmd5kmf9l4lq3pmte.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
             "package_name": "com.shilpi.geminibookfinder",
             "certificate_hash": "6901c466cf9df921e1ddf6d07929d26796b948d8"
+          }
+        },
+        {
+          "client_id": "49061491719-jp6q6cmkreise8s8tlnim42ev9pvr10h.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB7P4GlhExxDnU0KrHjO2qZWgdjqhCnwYg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "49061491719-jp6q6cmkreise8s8tlnim42ev9pvr10h.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:49061491719:android:fef50f133887297d3fa6a2",
+        "android_client_info": {
+          "package_name": "com.shilpi.lumina"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "49061491719-n7s20p3blevlg5b9thdoc0lifj28lija.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.shilpi.lumina",
+            "certificate_hash": "6901c466cf9df921e1ddf6d07929d26796b948d8"
+          }
+        },
+        {
+          "client_id": "49061491719-sm3ft9o57nlr2p6gvbh4h4lhjrqfgtdg.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.shilpi.lumina",
+            "certificate_hash": "2a8974c6e7a2cf89327b75156a37348e14764f41"
           }
         },
         {

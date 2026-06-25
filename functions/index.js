@@ -72,16 +72,20 @@ function getRequestIp(request) {
   );
 }
 
-function isGeminiQuotaError(status, result) {
+function shouldUseClaudeFallback(status, result) {
   const code = String(result?.error?.status || result?.error?.code || '').toLowerCase();
   const message = String(result?.error?.message || '').toLowerCase();
 
   return (
     status === 429 ||
+    status === 503 ||
     code.includes('resource_exhausted') ||
+    code.includes('unavailable') ||
     code.includes('quota') ||
+    message.includes('high demand') ||
     message.includes('quota') ||
     message.includes('rate limit') ||
+    message.includes('temporarily unavailable') ||
     message.includes('resource exhausted')
   );
 }
@@ -106,6 +110,13 @@ function toAnthropicContent(contents) {
         });
       }
     }
+  }
+
+  if (contentBlocks.some((block) => block.type === 'text')) {
+    contentBlocks.push({
+      type: 'text',
+      text: 'Return raw JSON only. Do not wrap the response in Markdown or code fences.',
+    });
   }
 
   return contentBlocks;
@@ -299,7 +310,7 @@ export const generateGeminiContent = onCall(
       return { ...gemini.result, provider: 'gemini', model: GEMINI_MODEL };
     }
 
-    if (!isGeminiQuotaError(gemini.status, gemini.result)) {
+    if (!shouldUseClaudeFallback(gemini.status, gemini.result)) {
       await recordUsageSafely({
         auth: request.auth,
         callType,

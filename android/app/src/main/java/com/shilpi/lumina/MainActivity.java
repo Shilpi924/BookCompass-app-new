@@ -1,4 +1,4 @@
-package com.shilpi.geminibookfinder;
+package com.shilpi.lumina;
 
 import android.os.Bundle;
 import com.getcapacitor.BridgeActivity;
@@ -8,6 +8,7 @@ public class MainActivity extends BridgeActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         registerPlugin(FirebaseAuthenticationPlugin.class);
+        registerPlugin(NativeSpeechPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }
