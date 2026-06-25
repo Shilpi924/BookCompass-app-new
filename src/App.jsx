@@ -94,9 +94,11 @@ const BLOCKED_NAME_TERMS = [
   "www",
 ];
 const DAILY_GUEST_SCAN_LIMIT = 12;
+const ANONYMOUS_SCAN_LIMIT = 10;
 const DAILY_USER_SCAN_LIMIT = 30;
 const DEVELOPER_EMAILS = ["shilpispin@gmail.com"];
 const DEFAULT_FOLDERS = ["Want to read", "For kids", "Gift ideas", "Favorites"];
+const NO_PREVIEW_LABEL = "NP";
 const HIDDEN_FOLDER_NAMES = new Set(["read aloud", "school"]);
 const NEW_FOLDER_OPTION = "__new_folder__";
 const MAX_LIBRARY_CARDS = 10;
@@ -205,7 +207,7 @@ function getDailyScanUsage(user) {
 
 function canStartScan(user) {
   const usage = getDailyScanUsage(user);
-  const scanLimit = user ? DAILY_USER_SCAN_LIMIT : DAILY_GUEST_SCAN_LIMIT;
+  const scanLimit = user ? DAILY_USER_SCAN_LIMIT : ANONYMOUS_SCAN_LIMIT;
 
   return Number(usage.count || 0) < scanLimit;
 }
@@ -224,9 +226,9 @@ function recordLocalScanUsage(user) {
 }
 
 function getScanLimitMessage(user) {
-  const scanLimit = user ? DAILY_USER_SCAN_LIMIT : DAILY_GUEST_SCAN_LIMIT;
+  const scanLimit = user ? DAILY_USER_SCAN_LIMIT : ANONYMOUS_SCAN_LIMIT;
 
-  return `Daily scan limit reached. ${user ? "" : "Log in for a higher limit. "}Limit: ${scanLimit} scans/day.`;
+  return `Scan limit reached. ${user ? "" : "Continue with Google to keep scanning. "}Limit: ${scanLimit} scans.`;
 }
 
 function getUserAppStateRef(uid) {
@@ -521,6 +523,11 @@ function getVisibleFolders(folders) {
   return (Array.isArray(folders) ? folders : DEFAULT_FOLDERS).filter(
     (folder) => !HIDDEN_FOLDER_NAMES.has(normalizeBookText(folder))
   );
+}
+
+function getFolderDisplayLabel(folderName) {
+  if (normalizeBookText(folderName) === "want to read") return "WR";
+  return folderName;
 }
 
 function normalizeBookText(text) {
@@ -1311,19 +1318,35 @@ function getScanConfidence(book) {
   const source = String(book?.ratingSource || "").trim().toLowerCase();
 
   if (!title || title.length < 4 || author === "unknown") {
-    return { label: "Needs review", reason: "Title or author may need correction." };
+    return { label: "Confidence: low", reason: "Title or author may need correction." };
   }
   if (source === "estimated" || title.split(" ").length < 2) {
-    return { label: "Possible match", reason: "Lumina estimated some details." };
+    return { label: "Confidence: medium", reason: "Lumina estimated some details." };
   }
-  return { label: "High confidence", reason: "Title and metadata look complete." };
+  return { label: "Confidence: high", reason: "Title and metadata look complete." };
+}
+
+function getScanConfidenceDisplayLabel(book) {
+  const label = String(book?.scanConfidence || getScanConfidence(book).label || "");
+
+  if (/please check title/i.test(label)) return "Confidence: low";
+  if (/best guess/i.test(label)) return "Confidence: medium";
+  if (/looks correct/i.test(label)) return "Confidence: high";
+  if (/needs review/i.test(label)) return "Confidence: low";
+  if (/high confidence/i.test(label)) return "Confidence: high";
+
+  return label;
 }
 
 function enrichScannedBook(book) {
   const confidence = getScanConfidence(book);
+  const shelfLocation = String(book?.shelfLocation || "").trim();
 
   return {
     ...book,
+    shelfLocation:
+      shelfLocation ||
+      "Shelf location was not captured for this book. Scan the shelf again to get row, side, and order details.",
     scanConfidence: book?.scanConfidence || confidence.label,
     confidenceReason: book?.confidenceReason || confidence.reason,
     reviewed: Boolean(book?.reviewed),
@@ -1458,6 +1481,7 @@ export default function App() {
     book: null,
     name: "",
   });
+  const [openShelfLocations, setOpenShelfLocations] = useState({});
   const [compare, setCompare] = useState([]);
   const [compareOpen, setCompareOpen] = useState(false);
   const [geminiUsage, setGeminiUsage] = useState(getInitialGeminiUsage);
@@ -1488,6 +1512,7 @@ export default function App() {
   const [libraryCardMessage, setLibraryCardMessage] = useState("");
   const [libraryCardLoginPromptOpen, setLibraryCardLoginPromptOpen] =
     useState(false);
+  const [scanLimitPromptOpen, setScanLimitPromptOpen] = useState(false);
   const [openSections, setOpenSections] = useState(() => ({
     ...SECTION_DEFAULT_OPEN,
     ...readStoredJson("openSections", {}),
@@ -1521,6 +1546,16 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("openSections", JSON.stringify(openSections));
   }, [openSections]);
+
+  useEffect(() => {
+    if (compare.length === 2 && !compareOpen) {
+      setCompareOpen(true);
+    }
+
+    if (compare.length < 2 && compareOpen) {
+      setCompareOpen(false);
+    }
+  }, [compare.length, compareOpen]);
 
   useEffect(() => {
     if (!authLoading) return undefined;
@@ -2513,6 +2548,7 @@ Do not include explanations.
 
     setError("");
     setLoading(true);
+    window.scrollTo({ top: 0, behavior: "smooth" });
     setBooks([]);
     setPreviewCache({});
     setSearch("");
@@ -2523,6 +2559,13 @@ Do not include explanations.
 
     let geminiCallStarted = false;
     try {
+      if (!canStartScan(quotaUser)) {
+        setLoading(false);
+        setError("Scan limit reached. Continue with Google to keep scanning.");
+        setScanLimitPromptOpen(true);
+        return;
+      }
+
       await ensureScanAuth();
       const base64 = await encodeFileToBase64(file);
       recordLocalScanUsage(quotaUser);
@@ -2555,7 +2598,8 @@ Return ONLY valid JSON in this exact format:
       "gradeBand": "K-3 / 4-6 / 7+",
       "ageRecommendation": "Kids / Young Readers / Teen / Adult / All ages",
       "whyRead": "Why someone may like this book",
-      "shelfPick": "Top Rated / Hidden Gem / Beginner Friendly / Popular / Educational"
+      "shelfPick": "Top Rated / Hidden Gem / Beginner Friendly / Popular / Educational",
+      "shelfLocation": "Very detailed location in the photo, such as top row left side, middle row center, bottom row right side, third book from the left, leaning behind another book, or partly hidden"
     }
   ]
 }
@@ -2571,6 +2615,10 @@ Important:
 - Include at most 12 books.
 - Do not invent too many books.
 - Only include books you can reasonably detect.
+- For shelfLocation, describe exactly where the book appears in the image:
+  row from top to bottom, left/middle/right section, order from left or right,
+  whether it is vertical, horizontal, leaning, stacked, partly hidden, or near
+  another visible book.
 - Keep summaries short.
                 `,
             },
@@ -3461,8 +3509,10 @@ Important:
     const previewButton = getPreviewButtonState(book);
     const favoriteSaved = isBookInReadingList(book);
     const compareSelected = compare.some((selectedBook) => getBookKey(selectedBook) === getBookKey(book));
-    const confidence = book.scanConfidence || getScanConfidence(book).label;
+    const confidence = getScanConfidenceDisplayLabel(book);
     const folderName = bookFolders[getBookKey(book)] || "Want to read";
+    const bookKey = getBookKey(book) || `${book.title}-${index}`;
+    const shelfLocationOpen = Boolean(openShelfLocations[bookKey]);
 
     return (
       <div
@@ -3541,6 +3591,22 @@ Important:
               </button>
 
               <button
+                type="button"
+                style={{
+                  ...styles.smallButton,
+                  ...(shelfLocationOpen ? styles.selectedButton : {}),
+                }}
+                onClick={() =>
+                  setOpenShelfLocations((locations) => ({
+                    ...locations,
+                    [bookKey]: !shelfLocationOpen,
+                  }))
+                }
+              >
+                Shelf location
+              </button>
+
+              <button
                 style={{
                   ...styles.smallButton,
                   ...styles.favoriteButton,
@@ -3577,6 +3643,12 @@ Important:
                 {compareSelected ? "Comparing" : "⚖️ Compare"}
               </button>
             </div>
+
+            {shelfLocationOpen && (
+              <p style={styles.shelfLocationNote}>
+                <b>Where it is:</b> {book.shelfLocation}
+              </p>
+            )}
           </>
         )}
 
@@ -3656,6 +3728,18 @@ Important:
             aria-pressed={voiceListening}
           >
             {voiceListening ? "■" : "🎙"}
+          </button>
+          <button
+            type="button"
+            style={styles.clearComposerButton}
+            onClick={() => {
+              setSearch("");
+              setVoiceStatus("Search cleared.");
+            }}
+            aria-label="Clear search"
+            title="Clear search"
+          >
+            ✕
           </button>
           <button
             type="button"
@@ -4356,7 +4440,7 @@ Important:
                     >
                       {getVisibleFolders(folders).map((folder) => (
                         <option key={folder} value={folder}>
-                          {folder}
+                          {getFolderDisplayLabel(folder)}
                         </option>
                       ))}
                       <option value={NEW_FOLDER_OPTION}>Add new folder...</option>
@@ -4371,7 +4455,7 @@ Important:
                       Open Preview
                     </button>
                   ) : (
-                    <span style={styles.noPreviewBadge}>No preview available</span>
+                    <span style={styles.noPreviewBadge}>{NO_PREVIEW_LABEL}</span>
                   )}
 
                   <button
@@ -4750,10 +4834,34 @@ Important:
           )}
         </div>
 
-        <div style={styles.heroArt} aria-hidden="true">
-          <span style={{ ...styles.agentDot, background: "#2563eb" }} />
-          <span style={{ ...styles.agentDot, background: "#18794e" }} />
-          <span style={{ ...styles.agentDot, background: "#f59e0b" }} />
+        <div style={styles.heroArt}>
+          <button
+            type="button"
+            style={{ ...styles.heroNavButton, "--nav-accent": "#2563eb" }}
+            onClick={() => setCurrentPage("scan")}
+            aria-label="Go to scan"
+            title="Go to scan"
+          >
+            <span style={{ ...styles.agentDot, background: "#2563eb" }} />
+          </button>
+          <button
+            type="button"
+            style={{ ...styles.heroNavButton, "--nav-accent": "#18794e" }}
+            onClick={() => setCurrentPage("saved")}
+            aria-label="Go to saved books"
+            title="Go to saved books"
+          >
+            <span style={{ ...styles.agentDot, background: "#18794e" }} />
+          </button>
+          <button
+            type="button"
+            style={{ ...styles.heroNavButton, "--nav-accent": "#b45309" }}
+            onClick={() => setCurrentPage("account")}
+            aria-label="Go to account"
+            title="Go to account"
+          >
+            <span style={{ ...styles.agentDot, background: "#b45309" }} />
+          </button>
         </div>
       </div>
 
@@ -4789,7 +4897,25 @@ Important:
       {renderFilterControls()}
 
       {imagePreview && (
-        <img src={imagePreview} alt="Bookshelf" style={styles.preview} />
+        <div style={styles.previewBlock}>
+          <img src={imagePreview} alt="Bookshelf" style={styles.preview} />
+          <button
+            type="button"
+            style={styles.clearPreviewButton}
+            onClick={() => {
+              setImagePreview(null);
+              setBooks([]);
+              setSelectedBook(null);
+              setCompare([]);
+              setCompareOpen(false);
+              setSimilarBooksView(null);
+              setError("");
+              setSaveStatus(null);
+            }}
+          >
+            Clear scanned image
+          </button>
+        </div>
       )}
 
       {error && <p style={styles.error}>{error}</p>}
@@ -4976,12 +5102,16 @@ Important:
 
                   <div style={styles.detailMiniCard}>
                     <b>✅ Confidence</b>
-                    <p>{selectedBook.scanConfidence || getScanConfidence(selectedBook).label}</p>
+                    <p>{getScanConfidenceDisplayLabel(selectedBook)}</p>
                   </div>
 
                   <div style={styles.detailMiniCard}>
                     <b>📁 Folder</b>
-                    <p>{bookFolders[getBookKey(selectedBook)] || "Want to read"}</p>
+                    <p>
+                      {getFolderDisplayLabel(
+                        bookFolders[getBookKey(selectedBook)] || "Want to read"
+                      )}
+                    </p>
                   </div>
                 </div>
 
@@ -5206,13 +5336,18 @@ Important:
             <div style={styles.previewActionRow}>
               <button
                 style={styles.secondaryButton}
-                onClick={() => setCompare([])}
+                onClick={() => {
+                  setCompare([]);
+                  setCompareOpen(false);
+                }}
               >
                 Clear Compare
               </button>
               <button
                 style={{ ...styles.closeButton, marginTop: 0 }}
-                onClick={() => setCompareOpen(false)}
+                onClick={() => {
+                  setCompareOpen(false);
+                }}
               >
                 Close
               </button>
@@ -5260,6 +5395,39 @@ Important:
                 onClick={() => setLibraryCardLoginPromptOpen(false)}
               >
                 Not now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {scanLimitPromptOpen && (
+        <div style={styles.modal}>
+          <div style={styles.promptModalContent}>
+            <div style={styles.promptIcon} aria-hidden="true">⌕</div>
+            <h2 style={styles.modalTitle}>Scan limit reached</h2>
+            <p style={styles.previewSubtitle}>
+              You have used your 10 anonymous scans. Continue with Google to keep scanning.
+            </p>
+            <div style={styles.previewActionRow}>
+              <button
+                type="button"
+                style={styles.googleSignInButton}
+                onClick={() => {
+                  setScanLimitPromptOpen(false);
+                  handleGoogleLogin();
+                }}
+                disabled={authLoading || !isFirebaseConfigured}
+              >
+                <span style={styles.googleSignInIcon} aria-hidden="true">G</span>
+                <span>Continue with Google</span>
+              </button>
+              <button
+                type="button"
+                style={styles.secondaryButton}
+                onClick={() => setScanLimitPromptOpen(false)}
+              >
+                Close
               </button>
             </div>
           </div>
@@ -5496,6 +5664,7 @@ const styles = {
       "linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(248, 250, 252, 0.9))",
     color: "#4f5f73",
     backdropFilter: "blur(12px)",
+    paddingBottom: "calc(140px + env(safe-area-inset-bottom))",
   },
   hero: {
     background:
@@ -5619,6 +5788,20 @@ const styles = {
     maxWidth: "100%",
     minWidth: 0,
     boxShadow: "0 18px 44px rgba(37, 99, 235, 0.12)",
+  },
+  heroNavButton: {
+    width: "28px",
+    height: "28px",
+    borderRadius: "8px",
+    border: "1px solid rgba(34, 49, 71, 0.08)",
+    background: "rgba(255, 255, 255, 0.7)",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 0,
+    cursor: "pointer",
+    flex: "0 0 auto",
+    boxShadow: "0 8px 18px rgba(31, 45, 61, 0.08)",
   },
   agentDot: {
     width: "12px",
@@ -6346,6 +6529,23 @@ const styles = {
     border: "1px solid #d7e0ec",
     boxShadow: "0 16px 36px rgba(0,0,0,0.22)",
   },
+  previewBlock: {
+    display: "grid",
+    gap: "10px",
+    marginBottom: "20px",
+  },
+  clearPreviewButton: {
+    minHeight: "38px",
+    padding: "8px 12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(34, 49, 71, 0.14)",
+    background: "rgba(34, 49, 71, 0.06)",
+    color: "#243044",
+    cursor: "pointer",
+    fontWeight: "700",
+    fontSize: "13px",
+    textAlign: "center",
+  },
   loading: {
     fontWeight: "600",
     color: "#2563eb",
@@ -6355,9 +6555,9 @@ const styles = {
     inset: 0,
     zIndex: 1200,
     display: "flex",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "center",
-    padding: "22px",
+    padding: "max(18px, calc(env(safe-area-inset-top) + 14px)) 22px 22px",
     background: "rgba(15, 23, 42, 0.34)",
     backdropFilter: "blur(8px)",
   },
@@ -6434,6 +6634,19 @@ const styles = {
     color: "#b91c1c",
     border: "1px solid rgba(220, 38, 38, 0.48)",
     boxShadow: "0 0 0 4px rgba(220, 38, 38, 0.14)",
+  },
+  clearComposerButton: {
+    width: "36px",
+    height: "36px",
+    flex: "0 0 36px",
+    borderRadius: "8px",
+    border: "1px solid rgba(34, 49, 71, 0.12)",
+    background: "rgba(34, 49, 71, 0.06)",
+    color: "#243044",
+    cursor: "pointer",
+    fontSize: "16px",
+    fontWeight: "800",
+    lineHeight: 1,
   },
   sendComposerButton: {
     width: "36px",
@@ -6785,6 +6998,17 @@ const styles = {
     border: "1px solid rgba(37, 99, 235, 0.46)",
     background: "rgba(26, 115, 232, 0.18)",
     color: "#1d4ed8",
+  },
+  shelfLocationNote: {
+    margin: "14px 0 0",
+    padding: "10px 12px",
+    borderRadius: "8px",
+    border: "1px solid rgba(37, 99, 235, 0.22)",
+    background: "rgba(239, 246, 255, 0.9)",
+    color: "#243044",
+    fontSize: "13px",
+    lineHeight: 1.45,
+    overflowWrap: "anywhere",
   },
   disabledButton: {
     border: "1px solid rgba(154, 160, 166, 0.22)",
